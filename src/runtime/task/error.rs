@@ -33,9 +33,6 @@ impl JoinError {
 
     /// Returns true if the error was caused by the task being cancelled.
     ///
-    /// See [the module level docs] for more information on cancellation.
-    ///
-    /// [the module level docs]: crate::task#cancellation
     pub fn is_cancelled(&self) -> bool {
         matches!(&self.repr, Repr::Cancelled)
     }
@@ -45,19 +42,15 @@ impl JoinError {
     /// # Examples
     ///
     /// ```
-    /// # #[cfg(not(target_family = "wasm"))]
-    /// # {
-    /// use std::panic;
+    /// let rt = scr::Runtime::new();
     ///
-    /// #[tokio::main]
-    /// async fn main() {
-    ///     let err = tokio::spawn(async {
+    /// rt.block_on(async {
+    ///     let err = scr::spawn(async {
     ///         panic!("boom");
     ///     }).await.unwrap_err();
     ///
     ///     assert!(err.is_panic());
-    /// }
-    /// # }
+    /// });
     /// ```
     pub fn is_panic(&self) -> bool {
         matches!(&self.repr, Repr::Panic(_))
@@ -73,12 +66,13 @@ impl JoinError {
     ///
     /// # Examples
     ///
-    /// ```should_panic,ignore-wasm
+    /// ```should_panic
     /// use std::panic;
     ///
-    /// #[tokio::main]
-    /// async fn main() {
-    ///     let err = tokio::spawn(async {
+    /// let rt = scr::Runtime::new();
+    ///
+    /// rt.block_on(async {
+    ///     let err = scr::spawn(async {
     ///         panic!("boom");
     ///     }).await.unwrap_err();
     ///
@@ -86,7 +80,7 @@ impl JoinError {
     ///         // Resume the panic on the main task
     ///         panic::resume_unwind(err.into_panic());
     ///     }
-    /// }
+    /// });
     /// ```
     #[track_caller]
     pub fn into_panic(self) -> Box<dyn Any + Send + 'static> {
@@ -100,12 +94,13 @@ impl JoinError {
     ///
     /// # Examples
     ///
-    /// ```should_panic,ignore-wasm
+    /// ```should_panic
     /// use std::panic;
     ///
-    /// #[tokio::main]
-    /// async fn main() {
-    ///     let err = tokio::spawn(async {
+    /// let rt = scr::Runtime::new();
+    ///
+    /// rt.block_on(async {
+    ///     let err = scr::spawn(async {
     ///         panic!("boom");
     ///     }).await.unwrap_err();
     ///
@@ -113,7 +108,7 @@ impl JoinError {
     ///         // Resume the panic on the main task
     ///         panic::resume_unwind(reason);
     ///     }
-    /// }
+    /// });
     /// ```
     pub fn try_into_panic(self) -> Result<Box<dyn Any + Send + 'static>, JoinError> {
         match self.repr {
@@ -169,13 +164,10 @@ impl std::error::Error for JoinError {}
 
 impl From<JoinError> for io::Error {
     fn from(src: JoinError) -> io::Error {
-        io::Error::new(
-            io::ErrorKind::Other,
-            match src.repr {
-                Repr::Cancelled => "task was cancelled",
-                Repr::Panic(_) => "task panicked",
-            },
-        )
+        io::Error::other(match src.repr {
+            Repr::Cancelled => "task was cancelled",
+            Repr::Panic(_) => "task panicked",
+        })
     }
 }
 

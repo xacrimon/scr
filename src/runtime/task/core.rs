@@ -1,20 +1,46 @@
+//! Core task module.
+//!
+//! # Safety
+//!
+//! The functions in this module are private to the `task` module. All of them
+//! should be considered `unsafe` to use, but are not marked as such since it
+//! would be too noisy.
+//!
+//! Make sure to consult the relevant safety section of each function before
+//! use.
+
 #![expect(unsafe_op_in_unsafe_fn)]
 
+use std::num::NonZeroU64;
 use std::panic::Location;
 use std::pin::Pin;
-use std::ptr::NonNull;
+use std::ptr::{self, NonNull};
 use std::task::{Context, Poll, Waker};
-use std::cell::UnsafeCell;
+
 use super::Id;
+use super::Schedule;
+use super::list::Pointers;
+use super::raw::{self, Vtable};
 use super::state::State;
-use super::raw::Vtable;
-
 use crate::runtime::context;
+use crate::util::UnsafeCell;
 
+/// The task cell. Contains the components of the task.
+///
+/// It is critical for `Header` to be the first field as the task structure will
+/// be referenced by both *mut Cell and *mut Header.
+///
+/// Any changes to the layout of this struct _must_ also be reflected in the
+/// `const` fns in raw.rs.
 #[repr(C)]
 pub(super) struct Cell<T: Future, S> {
+    /// Hot task state data.
     pub(super) header: Header,
+
+    /// Either the future or output, depending on the execution stage.
     pub(super) core: Core<T, S>,
+
+    /// Cold data.
     pub(super) trailer: Trailer,
 }
 
@@ -22,24 +48,58 @@ pub(super) struct CoreStage<T: Future> {
     stage: UnsafeCell<Stage<T>>,
 }
 
+/// The core of the task.
+///
+/// Holds the future or output, depending on the stage of execution.
+///
+/// Any changes to the layout of this struct _must_ also be reflected in the
+/// `const` fns in raw.rs.
 #[repr(C)]
 pub(super) struct Core<T: Future, S> {
+    /// Scheduler used to drive this future.
     pub(super) scheduler: S,
+
+    /// The task's ID, is used for the `JoinHandle` and for tracking which task
+    /// is currently running.
     pub(super) task_id: Id,
+
+    /// The source code location where this task was spawned.
     pub(super) spawned_at: &'static Location<'static>,
+
+    /// Either the future or the output.
     pub(super) stage: CoreStage<T>,
 }
 
+/// Crate public as this is also needed by the pool.
+///
+/// The header is the only part of the task that is accessed without knowing the
+/// concrete `T` and `S` types, so it is kept as small as possible: two words.
+/// Everything that is only needed on cold paths lives in the [`Trailer`].
 #[repr(C)]
 pub(crate) struct Header {
-    pub(super) state: std::cell::Cell<State>,
+    /// Task state.
+    pub(super) state: State,
+
+    /// Table of function pointers for executing actions on the task.
     pub(super) vtable: &'static Vtable,
 }
 
+/// Cold data is stored after the future. Any change to the layout of this
+/// struct _must_ also be reflected in `Trailer::addr_of_owned`.
+#[repr(C)]
 pub(super) struct Trailer {
+    /// Pointers for the linked list in the `OwnedTasks` that owns this task.
+    pub(super) owned: Pointers,
+
+    /// The id of the `OwnedTasks` this task belongs to, or `None` if the task
+    /// is not stored in any list.
+    pub(super) owner_id: UnsafeCell<Option<NonZeroU64>>,
+
+    /// Consumer task waiting on completion of this task.
     pub(super) waker: UnsafeCell<Option<Waker>>,
 }
 
+/// Either the future or the output.
 #[repr(C)]
 pub(super) enum Stage<T: Future> {
     Running(T),
@@ -48,6 +108,8 @@ pub(super) enum Stage<T: Future> {
 }
 
 impl<T: Future, S: Schedule> Cell<T, S> {
+    /// Allocates a new task cell, containing the header, trailer, and core
+    /// structures.
     pub(super) fn new(
         future: T,
         scheduler: S,
@@ -55,23 +117,15 @@ impl<T: Future, S: Schedule> Cell<T, S> {
         task_id: Id,
         spawned_at: &'static Location<'static>,
     ) -> Box<Cell<T, S>> {
-        fn new_header(
-            state: State,
-            vtable: &'static Vtable,
-        ) -> Header {
-            Header {
-                state: std::cell::Cell::new(state),
-                vtable,
-            }
+        // Separated into a non-generic function to reduce LLVM codegen
+        fn new_header(state: State, vtable: &'static Vtable) -> Header {
+            Header { state, vtable }
         }
 
         let vtable = raw::vtable::<T, S>();
         let result = Box::new(Cell {
             trailer: Trailer::new(),
-            header: new_header(
-                state,
-                vtable,
-            ),
+            header: new_header(state, vtable),
             core: Core {
                 scheduler,
                 stage: CoreStage {
@@ -84,6 +138,9 @@ impl<T: Future, S: Schedule> Cell<T, S> {
 
         #[cfg(debug_assertions)]
         {
+            // Using a separate function for this code avoids instantiating it separately for every
+            // generic parameter.
+            #[inline(never)]
             unsafe fn check<S>(
                 header: &Header,
                 trailer: &Trailer,
@@ -103,13 +160,11 @@ impl<T: Future, S: Schedule> Cell<T, S> {
                 let id_ptr = unsafe { Header::get_id_ptr(NonNull::from(header)) };
                 assert_eq!(id_addr, id_ptr.as_ptr() as usize);
 
-                {
-                    let spawn_location_addr =
-                        spawn_location as *const &'static Location<'static> as usize;
-                    let spawn_location_ptr =
-                        unsafe { Header::get_spawn_location_ptr(NonNull::from(header)) };
-                    assert_eq!(spawn_location_addr, spawn_location_ptr.as_ptr() as usize);
-                }
+                let spawn_location_addr =
+                    spawn_location as *const &'static Location<'static> as usize;
+                let spawn_location_ptr =
+                    unsafe { Header::get_spawn_location_ptr(NonNull::from(header)) };
+                assert_eq!(spawn_location_addr, spawn_location_ptr.as_ptr() as usize);
             }
             unsafe {
                 check(
@@ -126,24 +181,23 @@ impl<T: Future, S: Schedule> Cell<T, S> {
     }
 }
 
-impl<T: Future> CoreStage<T> {
-    pub(super) fn with_mut<R>(&self, f: impl FnOnce(*mut Stage<T>) -> R) -> R {
-        self.stage.with_mut(f)
-    }
+/// Set and clear the task id in the context when the future is executed or
+/// dropped, or when the output produced by the future is dropped.
+pub(crate) struct TaskIdGuard {
+    parent_task_id: Option<Id>,
 }
-
-pub(crate) struct TaskIdGuard;
 
 impl TaskIdGuard {
     fn enter(id: Id) -> Self {
-        context::set_task_id(Some(id));
-        Self
+        TaskIdGuard {
+            parent_task_id: context::set_current_task_id(Some(id)),
+        }
     }
 }
 
 impl Drop for TaskIdGuard {
     fn drop(&mut self) {
-        context::set_task_id(None);
+        context::set_current_task_id(self.parent_task_id);
     }
 }
 
@@ -152,9 +206,9 @@ impl<T: Future, S: Schedule> Core<T, S> {
     ///
     /// # Safety
     ///
-    /// The caller must ensure it is safe to mutate the `state` field. This
-    /// requires ensuring mutual exclusion between any concurrent thread that
-    /// might modify the future or output field.
+    /// The caller must ensure it is safe to mutate the `stage` field. This
+    /// requires ensuring that the task is not concurrently polled, which is
+    /// guaranteed by the `RUNNING` bit acting as a lock.
     ///
     /// `self` must also be pinned. This is handled by storing the task on the
     /// heap.
@@ -215,7 +269,7 @@ impl<T: Future, S: Schedule> Core<T, S> {
         use std::mem;
 
         self.stage.stage.with_mut(|ptr| {
-            // Safety:: the caller ensures mutual exclusion to the field.
+            // Safety: the caller ensures mutual exclusion to the field.
             match mem::replace(unsafe { &mut *ptr }, Stage::Consumed) {
                 Stage::Finished(output) => output,
                 _ => panic!("JoinHandle polled after completion"),
@@ -230,10 +284,6 @@ impl<T: Future, S: Schedule> Core<T, S> {
 }
 
 impl Header {
-    pub(super) unsafe fn set_next(&self, next: Option<NonNull<Header>>) {
-        self.queue_next.with_mut(|ptr| *ptr = next);
-    }
-
     /// Gets a pointer to the `Trailer` of the task containing this `Header`.
     ///
     /// # Safety
@@ -298,8 +348,8 @@ impl Header {
         NonNull::new_unchecked(spawned_at)
     }
 
-    /// Gets the source code location where the task containing
-    /// this `Header` was spawned
+    /// Gets the source code location where the task containing this `Header`
+    /// was spawned.
     ///
     /// # Safety
     ///
@@ -314,25 +364,73 @@ impl Trailer {
     fn new() -> Self {
         Trailer {
             waker: UnsafeCell::new(None),
+            owned: Pointers::new(),
+            owner_id: UnsafeCell::new(None),
         }
     }
 
+    /// Gets a pointer to the `owned` field of the `Trailer`.
+    ///
+    /// # Safety
+    ///
+    /// The provided raw pointer must point at the trailer of a task.
+    pub(super) unsafe fn addr_of_owned(me: NonNull<Trailer>) -> NonNull<Pointers> {
+        let me = me.as_ptr();
+        let field = ptr::addr_of_mut!((*me).owned);
+        NonNull::new_unchecked(field)
+    }
+
+    /// # Safety
+    ///
+    /// The `JoinHandle` is the only owner of this field, and this runtime is
+    /// single threaded, so the caller must simply be the `JoinHandle` (or the
+    /// runtime once `JOIN_INTEREST` has been unset).
     pub(super) unsafe fn set_waker(&self, waker: Option<Waker>) {
         self.waker.with_mut(|ptr| {
             *ptr = waker;
         });
     }
 
+    /// Returns `true` if a waker is stored and it wakes the same task as
+    /// `waker`.
+    ///
+    /// # Safety
+    ///
+    /// See [`Trailer::set_waker`].
     pub(super) unsafe fn will_wake(&self, waker: &Waker) -> bool {
-        self.waker
-            .with(|ptr| (*ptr).as_ref().unwrap().will_wake(waker))
+        self.waker.with(|ptr| match &*ptr {
+            Some(stored) => stored.will_wake(waker),
+            None => false,
+        })
     }
 
+    /// Wakes the join waker, if one has been stored.
+    ///
+    /// Unlike `tokio`, a missing waker is not an error: the `JOIN_WAKER` bit
+    /// that would tell us whether one is present does not exist in a single
+    /// threaded runtime, so we simply check the `Option`.
     pub(super) fn wake_join(&self) {
-        self.waker.with(|ptr| match unsafe { &*ptr } {
-            Some(waker) => waker.wake_by_ref(),
-            None => panic!("waker missing"),
+        self.waker.with(|ptr| {
+            // Safety: the runtime only reads the waker once the task is
+            // complete, at which point the `JoinHandle` will not write to it.
+            if let Some(waker) = unsafe { &*ptr } {
+                waker.wake_by_ref();
+            }
         });
+    }
+
+    /// # Safety
+    ///
+    /// The caller must have exclusive access to the field, which is the case
+    /// during task construction and while holding the `OwnedTasks` lock.
+    pub(super) unsafe fn set_owner_id(&self, owner: NonZeroU64) {
+        self.owner_id.with_mut(|ptr| *ptr = Some(owner));
+    }
+
+    pub(super) fn get_owner_id(&self) -> Option<NonZeroU64> {
+        // Safety: the owner ID is only written during task construction and
+        // while removing the task from its list.
+        unsafe { self.owner_id.with(|ptr| *ptr) }
     }
 }
 

@@ -1,6 +1,5 @@
 #![expect(unsafe_op_in_unsafe_fn)]
 
-use std::future::Future;
 use crate::runtime::task::core::{Core, Trailer};
 use crate::runtime::task::{Cell, Harness, Header, Id, Schedule, State};
 use std::panic::Location;
@@ -200,7 +199,7 @@ impl RawTask {
         task: T,
         scheduler: S,
         id: Id,
-        _spawned_at: super::SpawnLocation,
+        spawned_at: super::SpawnLocation,
     ) -> RawTask
     where
         T: Future,
@@ -211,7 +210,7 @@ impl RawTask {
             scheduler,
             State::new(),
             id,
-            _spawned_at.0,
+            spawned_at.0,
         ));
         let ptr = unsafe { NonNull::new_unchecked(ptr.cast()) };
 
@@ -248,8 +247,8 @@ impl RawTask {
         &self.header().state
     }
 
-    /// Safety: mutual exclusion is required to call this function.
-    pub(crate) fn poll(self) {
+    /// Polls the task, consuming the ref-count held by the `Notified`.
+    pub(super) fn poll(self) {
         let vtable = self.header().vtable;
         unsafe { (vtable.poll)(self.ptr) }
     }
@@ -294,27 +293,6 @@ impl RawTask {
     pub(super) fn ref_inc(self) {
         self.header().state.ref_inc();
     }
-
-    /// Get the queue-next pointer
-    ///
-    /// This is for usage by the injection queue
-    ///
-    /// Safety: make sure only one queue uses this and access is synchronized.
-    pub(crate) unsafe fn get_queue_next(self) -> Option<RawTask> {
-        self.header()
-            .queue_next
-            .with(|ptr| *ptr)
-            .map(|p| RawTask::from_raw(p))
-    }
-
-    /// Sets the queue-next pointer
-    ///
-    /// This is for usage by the injection queue
-    ///
-    /// Safety: make sure only one queue uses this and access is synchronized.
-    pub(crate) unsafe fn set_queue_next(self, val: Option<RawTask>) {
-        self.header().set_next(val.map(|task| task.ptr));
-    }
 }
 
 impl Copy for RawTask {}
@@ -328,9 +306,7 @@ unsafe fn schedule<S: Schedule>(ptr: NonNull<Header>) {
     use crate::runtime::task::{Notified, Task};
 
     let scheduler = Header::get_scheduler::<S>(ptr);
-    scheduler
-        .as_ref()
-        .schedule(Notified(Task::from_raw(ptr.cast())));
+    scheduler.as_ref().schedule(Notified(Task::from_raw(ptr)));
 }
 
 unsafe fn dealloc<T: Future, S: Schedule>(ptr: NonNull<Header>) {
