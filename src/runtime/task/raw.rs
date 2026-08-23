@@ -238,7 +238,7 @@ impl RawTask {
         &self.header().state
     }
 
-    /// Polls the task, consuming the ref-count held by the `Notified`.
+    /// Polls the task, consuming the ref-count held by the `Runnable`.
     pub(super) fn poll(self) {
         let vtable = self.header().vtable;
         unsafe { (vtable.poll)(self.ptr) }
@@ -294,10 +294,10 @@ unsafe fn poll<T: Future, S: Schedule>(ptr: NonNull<Header>) {
 }
 
 unsafe fn schedule<S: Schedule>(ptr: NonNull<Header>) {
-    use crate::runtime::task::{Notified, Task};
+    use crate::runtime::task::{Runnable, Task};
 
     let scheduler = Header::get_scheduler::<S>(ptr);
-    scheduler.as_ref().schedule(Notified(Task::from_raw(ptr)));
+    scheduler.as_ref().schedule(Runnable(Task::from_raw(ptr)));
 }
 
 unsafe fn dealloc<T: Future, S: Schedule>(ptr: NonNull<Header>) {

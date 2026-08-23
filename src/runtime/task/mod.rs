@@ -13,7 +13,8 @@
 //! A task is usually referenced by multiple handles, and there are several
 //! types of handles.
 //!
-//!  * `OwnedTask` - tasks stored in an `OwnedTasks` are of this reference type.
+//!  * `Task` - the reference stored in the `OwnedTasks` collection that owns
+//!    the task.
 //!
 //!  * `JoinHandle` - each task has a `JoinHandle` that allows access to the
 //!    output of the task.
@@ -21,7 +22,8 @@
 //!  * `Waker` - every waker for a task has this reference type. There can be any
 //!    number of waker references.
 //!
-//!  * `Notified` - tracks whether the task is notified.
+//!  * `Runnable` - the unique permission to poll the task, and the token that
+//!    sits in the run queue.
 //!
 //! The task uses a reference count to keep track of how many active references
 //! exist. Each reference type takes up a single ref-count.
@@ -39,7 +41,7 @@
 //!  * `COMPLETE` - Is one once the future has fully completed and has been
 //!    dropped. Never unset once set. Never set together with RUNNING.
 //!
-//!  * `NOTIFIED` - Tracks whether a Notified object currently exists.
+//!  * `NOTIFIED` - Tracks whether a `Runnable` currently exists.
 //!
 //!  * `CANCELLED` - Is set to one for tasks that should be cancelled as soon as
 //!    possible. May take any value for completed tasks.
@@ -53,7 +55,9 @@
 //! The task has various fields. This section describes how and when it is safe
 //! to access a field.
 //!
-//!  * The `OwnedTask` reference has exclusive access to the `owned` field.
+//!  * The `owned` field holds the key the task is stored under in the
+//!    `OwnedTasks` that owns it. It is written only by that collection, under
+//!    the borrow it takes of its own interior.
 //!
 //!  * If COMPLETE is one, then the `JoinHandle` has exclusive access to the
 //!    stage field. If COMPLETE is zero, then the RUNNING bitfield functions as
@@ -82,17 +86,25 @@
 //!    by being on the same thread, so the waker field is a plain `Option<Waker>`
 //!    that the `JoinHandle` owns until it unsets `JOIN_INTEREST`.
 //!
-//!  * There is no `LocalNotified`, because every `Notified` is local, and no
-//!    `UnownedTask`, because there are no blocking tasks.
+//!  * The token that goes in the run queue is called `Runnable`, and there is
+//!    one of it. `tokio` splits it in two: a `Notified` that is safe to hand to
+//!    a scheduler, and a `LocalNotified` that is safe to poll on this thread.
+//!    Every task here is polled on the thread that owns it, so the distinction
+//!    collapses. There is also no `UnownedTask`, because there are no blocking
+//!    tasks.
+//!
+//!  * `OwnedTasks` is a `Slab` rather than an intrusive doubly linked list, so
+//!    the `owned` field of the `Trailer` is a slab key rather than a pair of
+//!    link pointers. See the docs on that module.
 //!
 //!  * There is no `owner_id`. `tokio` stamps each task with the id of the
 //!    `OwnedTasks` holding it, both to tell "in no list" from "sole element of
 //!    a list" and to catch a task being released through the wrong runtime.
-//!    Neither is needed here: `OwnedTasks::remove` distinguishes the two cases
-//!    structurally (see the invariant on `list::LinkedList::remove`), and a
-//!    task is only ever released through the scheduler in its own `Core`, so
-//!    the wrong-runtime case cannot arise. Dropping the field also removed the
-//!    last atomic in the crate, the counter that generated those ids.
+//!    Neither is needed here: a task not in a collection holds the `NOT_OWNED`
+//!    sentinel as its key, and a task is only ever released through the
+//!    scheduler in its own `Core`, so the wrong-runtime case cannot arise.
+//!    Dropping the field also removed the last atomic in the crate, the counter
+//!    that generated those ids.
 //!
 //!  * No task type implements `Send` or `Sync`.
 //!
@@ -144,8 +156,8 @@ pub use self::id::{Id, id, try_id};
 mod join;
 pub use self::join::JoinHandle;
 
-mod list;
-pub(crate) use self::list::OwnedTasks;
+mod owned;
+pub(crate) use self::owned::OwnedTasks;
 
 mod raw;
 pub(crate) use self::raw::RawTask;
@@ -167,9 +179,14 @@ pub(crate) struct Task<S: 'static> {
     _p: PhantomData<S>,
 }
 
-/// A task was notified.
+/// The unique permission to poll a task, and the token that sits in the run
+/// queue.
+///
+/// At most one exists for a task at a time, and the `NOTIFIED` bit tracks
+/// whether one is outstanding. Waking a task mints one only if that bit was
+/// clear, which is what keeps a task from being queued twice.
 #[repr(transparent)]
-pub(crate) struct Notified<S: 'static>(Task<S>);
+pub(crate) struct Runnable<S: 'static>(Task<S>);
 
 /// Task result sent back.
 pub(crate) type Result<T> = std::result::Result<T, JoinError>;
@@ -183,12 +200,12 @@ pub(crate) trait Schedule: Sized + 'static {
     fn release(&self, task: &Task<Self>) -> Option<Task<Self>>;
 
     /// Schedule the task.
-    fn schedule(&self, task: Notified<Self>);
+    fn schedule(&self, runnable: Runnable<Self>);
 
     /// Schedule the task to run in the near future, yielding the thread to
     /// other tasks.
-    fn yield_now(&self, task: Notified<Self>) {
-        self.schedule(task);
+    fn yield_now(&self, runnable: Runnable<Self>) {
+        self.schedule(runnable);
     }
 
     /// Polling the task resulted in a panic. Should the runtime shutdown?
@@ -199,14 +216,14 @@ pub(crate) trait Schedule: Sized + 'static {
 
 /// This is the constructor for a new task. Three references to the task are
 /// created. The first task reference is usually put into an `OwnedTasks`
-/// immediately. The Notified is sent to the scheduler as an ordinary
+/// immediately. The `Runnable` is sent to the scheduler as an ordinary
 /// notification.
 fn new_task<T, S>(
     task: T,
     scheduler: S,
     id: Id,
     spawned_at: SpawnLocation,
-) -> (Task<S>, Notified<S>, JoinHandle<T::Output>)
+) -> (Task<S>, Runnable<S>, JoinHandle<T::Output>)
 where
     S: Schedule,
     T: Future + 'static,
@@ -217,13 +234,13 @@ where
         raw,
         _p: PhantomData,
     };
-    let notified = Notified(Task {
+    let runnable = Runnable(Task {
         raw,
         _p: PhantomData,
     });
     let join = JoinHandle::new(raw);
 
-    (task, notified, join)
+    (task, runnable, join)
 }
 
 impl<S: 'static> Task<S> {
@@ -267,7 +284,7 @@ impl<S: 'static> Task<S> {
     }
 }
 
-impl<S: 'static> Notified<S> {
+impl<S: 'static> Runnable<S> {
     /// Returns a [task ID] that uniquely identifies this task relative to other
     /// currently spawned tasks.
     ///
@@ -287,7 +304,7 @@ impl<S: Schedule> Task<S> {
     }
 }
 
-impl<S: Schedule> Notified<S> {
+impl<S: Schedule> Runnable<S> {
     /// Runs the task.
     pub(crate) fn run(self) {
         let raw = self.0.raw;
@@ -312,9 +329,9 @@ impl<S> fmt::Debug for Task<S> {
     }
 }
 
-impl<S> fmt::Debug for Notified<S> {
+impl<S> fmt::Debug for Runnable<S> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(fmt, "task::Notified({:p})", self.0.header())
+        write!(fmt, "task::Runnable({:p})", self.0.header())
     }
 }
 

@@ -476,3 +476,42 @@ fn self_wake_by_value_during_poll() {
 
     assert_eq!(polls, 3);
 }
+
+/// The task registry is a slab, so the slot a finished task occupied is handed
+/// to a later one. Each task records its own key, and clears it on the way out,
+/// so a recycled slot must never let one task's release evict another. Parked
+/// tasks are interleaved between the waves so that the completing tasks free
+/// slots from the middle of the registry rather than only off the end.
+#[test]
+fn registry_slots_are_reused_as_tasks_complete() {
+    let rt = Runtime::new();
+
+    let out = rt.block_on(async {
+        let mut parked: Vec<JoinHandle<()>> = Vec::new();
+        let mut seen = Vec::new();
+
+        for wave in 0..4u32 {
+            // Never completes, so it holds its slot for the rest of the test.
+            parked.push(task::spawn(future::pending::<()>()));
+
+            let handles: Vec<JoinHandle<u32>> = (0..8u32)
+                .map(|i| task::spawn(async move { wave * 8 + i }))
+                .collect();
+
+            for handle in handles {
+                seen.push(handle.await.unwrap());
+            }
+        }
+
+        for handle in &parked {
+            assert!(!handle.is_finished(), "the parked tasks must still be live");
+        }
+
+        seen
+    });
+
+    assert_eq!(out, (0..32).collect::<Vec<u32>>());
+
+    // Dropping the runtime now shuts down four parked tasks that sit in a slab
+    // full of recycled and vacant slots.
+}

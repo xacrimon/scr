@@ -11,14 +11,15 @@
 
 #![expect(unsafe_op_in_unsafe_fn)]
 
+use std::cell;
 use std::panic::Location;
 use std::pin::Pin;
-use std::ptr::{self, NonNull};
+use std::ptr::NonNull;
 use std::task::{Context, Poll, Waker};
 
 use super::Id;
 use super::Schedule;
-use super::list::Pointers;
+use super::owned::NOT_OWNED;
 use super::raw::{self, Vtable};
 use super::state::State;
 use crate::runtime::context;
@@ -83,12 +84,12 @@ pub(crate) struct Header {
     pub(super) vtable: &'static Vtable,
 }
 
-/// Cold data is stored after the future. Any change to the layout of this
-/// struct _must_ also be reflected in `Trailer::addr_of_owned`.
+/// Cold data is stored after the future.
 #[repr(C)]
 pub(super) struct Trailer {
-    /// Pointers for the linked list in the `OwnedTasks` that owns this task.
-    pub(super) owned: Pointers,
+    /// The key this task is stored under in the `OwnedTasks` that owns it, or
+    /// `NOT_OWNED` if it is in none.
+    pub(super) owned: cell::Cell<usize>,
 
     /// Consumer task waiting on completion of this task.
     pub(super) waker: UnsafeCell<Option<Waker>>,
@@ -359,19 +360,8 @@ impl Trailer {
     fn new() -> Self {
         Trailer {
             waker: UnsafeCell::new(None),
-            owned: Pointers::new(),
+            owned: cell::Cell::new(NOT_OWNED),
         }
-    }
-
-    /// Gets a pointer to the `owned` field of the `Trailer`.
-    ///
-    /// # Safety
-    ///
-    /// The provided raw pointer must point at the trailer of a task.
-    pub(super) unsafe fn addr_of_owned(me: NonNull<Trailer>) -> NonNull<Pointers> {
-        let me = me.as_ptr();
-        let field = ptr::addr_of_mut!((*me).owned);
-        NonNull::new_unchecked(field)
     }
 
     /// # Safety

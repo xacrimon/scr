@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use crate::runtime::task::{self, JoinHandle, Notified, OwnedTasks, Schedule, SpawnLocation, Task};
+use crate::runtime::task::{self, JoinHandle, OwnedTasks, Runnable, Schedule, SpawnLocation, Task};
 
 const BASE_QUEUE_SIZE: usize = 32;
 
@@ -14,7 +14,7 @@ const BASE_QUEUE_SIZE: usize = 32;
 /// queue is ever held across a call into user code, so the `&mut` handed out by
 /// each method never overlaps with another.
 pub(crate) struct Queue {
-    inner: UnsafeCell<VecDeque<Notified<Rc<Handle>>>>,
+    inner: UnsafeCell<VecDeque<Runnable<Rc<Handle>>>>,
     _marker: PhantomData<*const ()>,
 }
 
@@ -26,13 +26,13 @@ impl Queue {
         }
     }
 
-    pub(crate) fn push(&self, runnable: Notified<Rc<Handle>>) {
+    pub(crate) fn push(&self, runnable: Runnable<Rc<Handle>>) {
         unsafe {
             (*self.inner.get()).push_back(runnable);
         }
     }
 
-    pub(crate) fn pop(&self) -> Option<Notified<Rc<Handle>>> {
+    pub(crate) fn pop(&self) -> Option<Runnable<Rc<Handle>>> {
         unsafe { (*self.inner.get()).pop_front() }
     }
 
@@ -74,12 +74,12 @@ impl Handle {
         F::Output: 'static,
     {
         let id = task::Id::next();
-        let (join, notified) = me
+        let (join, runnable) = me
             .owned
             .bind(future, Rc::clone(me), id, SpawnLocation::capture());
 
-        if let Some(notified) = notified {
-            me.queue.push(notified);
+        if let Some(runnable) = runnable {
+            me.queue.push(runnable);
         }
 
         join
@@ -104,8 +104,8 @@ impl Schedule for Rc<Handle> {
         self.owned.remove(task)
     }
 
-    fn schedule(&self, task: Notified<Self>) {
-        self.queue.push(task);
+    fn schedule(&self, runnable: Runnable<Self>) {
+        self.queue.push(runnable);
     }
 }
 

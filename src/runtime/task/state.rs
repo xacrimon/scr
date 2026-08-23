@@ -56,7 +56,7 @@ const REF_ONE: usize = 1 << REF_COUNT_SHIFT;
 ///  * A reference for the `JoinHandle`.
 ///
 /// As the task starts with a `JoinHandle`, `JOIN_INTEREST` is set.
-/// As the task starts with a `Notified`, `NOTIFIED` is set.
+/// As the task starts with a `Runnable`, `NOTIFIED` is set.
 const INITIAL_STATE: usize = (REF_ONE * 3) | JOIN_INTEREST | NOTIFIED;
 
 #[must_use]
@@ -156,7 +156,7 @@ impl State {
         next.unset_running();
 
         if !next.is_notified() {
-            // Polling the future consumes the ref-count of the Notified.
+            // Polling the future consumes the ref-count of the `Runnable`.
             next.ref_dec();
             self.store(next);
 
@@ -213,7 +213,7 @@ impl State {
     /// If no task needs to be submitted, a ref-count is consumed.
     ///
     /// If a task needs to be submitted, the ref-count is incremented for the
-    /// new Notified.
+    /// new `Runnable`.
     pub(super) fn transition_to_notified_by_val(&self) -> TransitionToNotifiedByVal {
         let mut next = self.load();
 

@@ -1,7 +1,7 @@
 use crate::runtime::task::core::{Cell, Core, Header, Trailer};
 use crate::runtime::task::state::State;
 use crate::runtime::task::waker::waker_ref;
-use crate::runtime::task::{Id, JoinError, Notified, RawTask, Schedule, Task};
+use crate::runtime::task::{Id, JoinError, RawTask, Runnable, Schedule, Task};
 
 use std::any::Any;
 use std::mem;
@@ -58,7 +58,7 @@ impl RawTask {
     }
 
     /// This call consumes a ref-count and notifies the task. This will create a
-    /// new Notified and submit it if necessary.
+    /// new `Runnable` and submit it if necessary.
     ///
     /// The caller does not need to hold a ref-count besides the one that was
     /// passed to this call.
@@ -69,7 +69,8 @@ impl RawTask {
             TransitionToNotifiedByVal::Submit => {
                 // The caller has given us a ref-count, and the transition has
                 // created a new ref-count, so we now hold two. We turn the new
-                // ref-count Notified and pass it to the call to `schedule`.
+                // ref-count into a `Runnable` and pass it to the call to
+                // `schedule`.
                 //
                 // The old ref-count is retained for now to ensure that the task
                 // is not dropped during the call to `schedule` if the call
@@ -88,7 +89,7 @@ impl RawTask {
     }
 
     /// This call notifies the task. It will not consume any ref-counts, but the
-    /// caller should hold a ref-count. This will create a new Notified and
+    /// caller should hold a ref-count. This will create a new `Runnable` and
     /// submit it if necessary.
     pub(super) fn wake_by_ref(&self) {
         use super::state::TransitionToNotifiedByRef;
@@ -115,11 +116,11 @@ impl RawTask {
     pub(super) fn remote_abort(&self) {
         if self.state().transition_to_notified_and_cancel() {
             // The transition has created a new ref-count, which we turn into
-            // a Notified and pass to the task.
+            // a `Runnable` and pass to the task.
             //
             // Since the caller holds a ref-count, the task cannot be destroyed
             // before the call to `schedule` returns even if the call drops the
-            // `Notified` internally.
+            // `Runnable` internally.
             self.schedule();
         }
     }
@@ -148,7 +149,7 @@ where
                 // We give one of them to a new task and call `yield_now`.
                 self.core()
                     .scheduler
-                    .yield_now(Notified(self.get_new_task()));
+                    .yield_now(Runnable(self.get_new_task()));
 
                 // The remaining ref-count is now dropped. We kept the extra
                 // ref-count until now to ensure that even if the `yield_now`
