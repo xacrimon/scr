@@ -1,5 +1,3 @@
-//! A single threaded async runtime.
-
 mod macros;
 mod runtime;
 mod util;

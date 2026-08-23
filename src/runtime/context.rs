@@ -37,26 +37,17 @@ pub(crate) fn current_task_id() -> Option<Id> {
 }
 
 /// Returns a handle to the runtime the current thread is entered into.
-pub(crate) fn try_current_handle() -> Option<Rc<Handle>> {
-    CONTEXT.with(|ctx| {
-        // `Cell` has no `get` for non-`Copy` values, so take the handle out and
-        // put a clone back.
-        let handle = ctx.handle.take();
-        let cloned = handle.clone();
-        ctx.handle.set(handle);
-        cloned
-    })
-}
-
-/// Returns a handle to the runtime the current thread is entered into.
 ///
 /// # Panics
 ///
 /// Panics if called from outside of a runtime.
-#[track_caller]
 pub(crate) fn current_handle() -> Rc<Handle> {
-    try_current_handle()
-        .expect("there is no reactor running, must be called from the context of a `scr` runtime")
+    CONTEXT.with(|ctx| {
+        let handle = ctx.handle.take().unwrap();
+        let cloned = handle.clone();
+        ctx.handle.set(Some(handle));
+        cloned
+    })
 }
 
 /// Restores the previously entered runtime, if any, when dropped.
@@ -75,6 +66,5 @@ impl Drop for EnterGuard {
 /// Enters the runtime, so that `spawn` and friends can find it.
 pub(crate) fn enter_runtime(handle: &Rc<Handle>) -> EnterGuard {
     let prev = CONTEXT.with(|ctx| ctx.handle.replace(Some(Rc::clone(handle))));
-
     EnterGuard { prev }
 }
