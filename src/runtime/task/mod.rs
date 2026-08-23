@@ -55,9 +55,6 @@
 //!
 //!  * The `OwnedTask` reference has exclusive access to the `owned` field.
 //!
-//!  * The `owner_id` field can be set as part of construction of the task, but
-//!    is otherwise only modified while removing the task from its list.
-//!
 //!  * If COMPLETE is one, then the `JoinHandle` has exclusive access to the
 //!    stage field. If COMPLETE is zero, then the RUNNING bitfield functions as
 //!    a lock for the stage field, and it can be accessed only by the caller
@@ -87,6 +84,15 @@
 //!
 //!  * There is no `LocalNotified`, because every `Notified` is local, and no
 //!    `UnownedTask`, because there are no blocking tasks.
+//!
+//!  * There is no `owner_id`. `tokio` stamps each task with the id of the
+//!    `OwnedTasks` holding it, both to tell "in no list" from "sole element of
+//!    a list" and to catch a task being released through the wrong runtime.
+//!    Neither is needed here: `OwnedTasks::remove` distinguishes the two cases
+//!    structurally (see the invariant on `list::LinkedList::remove`), and a
+//!    task is only ever released through the scheduler in its own `Core`, so
+//!    the wrong-runtime case cannot arise. Dropping the field also removed the
+//!    last atomic in the crate, the counter that generated those ids.
 //!
 //!  * No task type implements `Send` or `Sync`.
 //!
@@ -125,7 +131,6 @@ pub use self::abort::AbortHandle;
 mod core;
 use self::core::Cell;
 use self::core::Header;
-use self::core::Trailer;
 
 mod error;
 pub use self::error::JoinError;
@@ -244,10 +249,6 @@ impl<S: 'static> Task<S> {
         self.raw.header_ptr()
     }
 
-    fn trailer(&self) -> &Trailer {
-        self.raw.trailer()
-    }
-
     /// Returns a [task ID] that uniquely identifies this task relative to other
     /// currently spawned tasks.
     ///
@@ -267,10 +268,6 @@ impl<S: 'static> Task<S> {
 }
 
 impl<S: 'static> Notified<S> {
-    fn trailer(&self) -> &Trailer {
-        self.0.trailer()
-    }
-
     /// Returns a [task ID] that uniquely identifies this task relative to other
     /// currently spawned tasks.
     ///

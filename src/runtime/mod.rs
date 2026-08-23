@@ -82,7 +82,6 @@ impl Runtime {
                     break;
                 };
 
-                self.handle.owned.assert_owner(&task);
                 task.run();
                 ran = true;
 

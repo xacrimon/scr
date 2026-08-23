@@ -16,30 +16,11 @@
 
 use std::marker::{PhantomData, PhantomPinned};
 use std::mem::ManuallyDrop;
-use std::num::NonZeroU64;
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::runtime::task::core::{Header, Trailer};
 use crate::runtime::task::{JoinHandle, Notified, Schedule, SpawnLocation, Task};
 use crate::util::UnsafeCell;
-
-// The id from the counter below is used to verify whether a given task is
-// stored in this `OwnedTasks`, or some other one. The counter starts at one so
-// we can use `None` for tasks not owned by any list.
-//
-// Runtimes are per-thread but may be constructed on any thread, so this counter
-// is the one piece of shared state in the task module.
-static NEXT_OWNED_TASKS_ID: AtomicU64 = AtomicU64::new(1);
-
-fn get_next_id() -> NonZeroU64 {
-    loop {
-        let id = NEXT_OWNED_TASKS_ID.fetch_add(1, Ordering::Relaxed);
-        if let Some(id) = NonZeroU64::new(id) {
-            return id;
-        }
-    }
-}
 
 // ===== impl Pointers =====
 
@@ -177,7 +158,14 @@ impl<S: 'static> LinkedList<S> {
         }
     }
 
-    /// Removes the specified task from the list.
+    /// Removes the specified task from the list, returning `None` if it is not
+    /// linked into this list.
+    ///
+    /// This relies on the invariant that a node in no list has both pointers
+    /// null: such a node takes the `else` branch below, and `head` only ever
+    /// points at a linked node, so it returns `None` before mutating anything.
+    /// `Pointers::new` establishes the invariant and every method here restores
+    /// it by nulling both pointers on the way out.
     ///
     /// # Safety
     ///
@@ -231,7 +219,6 @@ impl<S: 'static> LinkedList<S> {
 
 pub(crate) struct OwnedTasks<S: 'static> {
     inner: UnsafeCell<Inner<S>>,
-    pub(crate) id: NonZeroU64,
     _not_send_or_sync: PhantomData<*const ()>,
 }
 
@@ -247,7 +234,6 @@ impl<S: 'static> OwnedTasks<S> {
                 list: LinkedList::new(),
                 closed: false,
             }),
-            id: get_next_id(),
             _not_send_or_sync: PhantomData,
         }
     }
@@ -267,12 +253,6 @@ impl<S: 'static> OwnedTasks<S> {
         T::Output: 'static,
     {
         let (task, notified, join) = super::new_task(task, scheduler, id, spawned_at);
-
-        unsafe {
-            // Safety: We just created the task, so we have exclusive access
-            // to the field.
-            task.trailer().set_owner_id(self.id);
-        }
 
         if self.is_closed() {
             drop(notified);
@@ -304,23 +284,18 @@ impl<S: 'static> OwnedTasks<S> {
 
     /// Removes a task from the collection, returning the ref-count that the
     /// collection held.
+    ///
+    /// Returns `None` if the task is not linked into this list, which is not an
+    /// error: `release` runs for every task that completes, and two paths reach
+    /// it with an unlinked task. A task bound while the list was closed is
+    /// never linked at all, and `close_and_shutdown_all` unlinks a task before
+    /// shutting it down.
     pub(crate) fn remove(&self, task: &Task<S>) -> Option<Task<S>> {
-        // If the task's owner ID is `None` then it is not part of any list and
-        // doesn't need removing.
-        let task_id = task.trailer().get_owner_id()?;
-
-        assert_eq!(task_id, self.id);
-
         self.with_inner(|inner|
-            // Safety: We just checked that the provided task is not in some
-            // other linked list.
+            // Safety: A task is only ever released through the scheduler stored
+            // in its own `Core`, which is the handle owning this list, so the
+            // task is either linked into this list or into no list at all.
             unsafe { inner.list.remove(task.header_ptr()) })
-    }
-
-    /// Asserts that the given task is owned by this `OwnedTasks`.
-    #[inline]
-    pub(crate) fn assert_owner(&self, task: &Notified<S>) {
-        assert_eq!(task.trailer().get_owner_id(), Some(self.id));
     }
 
     #[inline]

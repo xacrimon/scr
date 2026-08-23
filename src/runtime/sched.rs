@@ -108,3 +108,56 @@ impl Schedule for Rc<Handle> {
         self.queue.push(task);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::cell::Cell;
+
+    /// Binding a task to a closed `OwnedTasks` must shut the task down without
+    /// polling it, without queueing it, and without ever linking it into the
+    /// list. This is the one path on which `OwnedTasks::remove` is called for a
+    /// task that was never inserted.
+    #[test]
+    fn bind_on_closed_list_shuts_the_task_down() {
+        struct OnDrop(Rc<Cell<bool>>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        let handle = Handle::new();
+        handle.owned.close_and_shutdown_all();
+        assert!(handle.owned.is_closed());
+
+        let dropped = Rc::new(Cell::new(false));
+        let polled = Rc::new(Cell::new(false));
+
+        let join = {
+            // The guard is constructed here, not in the body, so that it is a
+            // capture of the future: an un-polled future drops its captures,
+            // but never runs its body.
+            let guard = OnDrop(Rc::clone(&dropped));
+            let polled = Rc::clone(&polled);
+            Handle::spawn(&handle, async move {
+                let _guard = guard;
+                polled.set(true);
+                std::future::pending::<()>().await;
+            })
+        };
+
+        assert!(
+            !polled.get(),
+            "a task bound to a closed list must not be polled"
+        );
+        assert!(dropped.get(), "its future must still be dropped");
+        assert!(handle.queue.is_empty(), "it must not be queued");
+        assert!(
+            handle.owned.is_empty(),
+            "it must not be linked into the list"
+        );
+        assert!(join.is_finished());
+    }
+}

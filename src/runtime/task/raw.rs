@@ -228,18 +228,9 @@ impl RawTask {
         self.ptr
     }
 
-    pub(super) fn trailer_ptr(&self) -> NonNull<Trailer> {
-        unsafe { Header::get_trailer(self.ptr) }
-    }
-
     /// Returns a reference to the task's header.
     pub(super) fn header(&self) -> &Header {
         unsafe { self.ptr.as_ref() }
-    }
-
-    /// Returns a reference to the task's trailer.
-    pub(super) fn trailer(&self) -> &Trailer {
-        unsafe { &*self.trailer_ptr().as_ptr() }
     }
 
     /// Returns a reference to the task's state.

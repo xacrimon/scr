@@ -11,7 +11,6 @@
 
 #![expect(unsafe_op_in_unsafe_fn)]
 
-use std::num::NonZeroU64;
 use std::panic::Location;
 use std::pin::Pin;
 use std::ptr::{self, NonNull};
@@ -90,10 +89,6 @@ pub(crate) struct Header {
 pub(super) struct Trailer {
     /// Pointers for the linked list in the `OwnedTasks` that owns this task.
     pub(super) owned: Pointers,
-
-    /// The id of the `OwnedTasks` this task belongs to, or `None` if the task
-    /// is not stored in any list.
-    pub(super) owner_id: UnsafeCell<Option<NonZeroU64>>,
 
     /// Consumer task waiting on completion of this task.
     pub(super) waker: UnsafeCell<Option<Waker>>,
@@ -365,7 +360,6 @@ impl Trailer {
         Trailer {
             waker: UnsafeCell::new(None),
             owned: Pointers::new(),
-            owner_id: UnsafeCell::new(None),
         }
     }
 
@@ -417,20 +411,6 @@ impl Trailer {
                 waker.wake_by_ref();
             }
         });
-    }
-
-    /// # Safety
-    ///
-    /// The caller must have exclusive access to the field, which is the case
-    /// during task construction and while holding the `OwnedTasks` lock.
-    pub(super) unsafe fn set_owner_id(&self, owner: NonZeroU64) {
-        self.owner_id.with_mut(|ptr| *ptr = Some(owner));
-    }
-
-    pub(super) fn get_owner_id(&self) -> Option<NonZeroU64> {
-        // Safety: the owner ID is only written during task construction and
-        // while removing the task from its list.
-        unsafe { self.owner_id.with(|ptr| *ptr) }
     }
 }
 
