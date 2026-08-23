@@ -1,13 +1,12 @@
 //! Asynchronous green-threads.
 
-use std::future::Future;
+use std::panic::Location;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 pub use crate::runtime::task::{AbortHandle, Id, JoinError, JoinHandle, id, try_id};
 
 use crate::runtime::context;
-use crate::runtime::sched::Handle;
 
 /// Spawns a new asynchronous task on the current runtime, returning a
 /// [`JoinHandle`] for it.
@@ -21,8 +20,9 @@ where
     F: Future + 'static,
     F::Output: 'static,
 {
-    let handle = context::current_handle();
-    Handle::spawn(&handle, future)
+    let spawned_at = Location::caller();
+
+    context::with_handle(|handle| handle.spawn(future, spawned_at))
 }
 
 /// Yields execution back to the runtime, so that other tasks in the run queue

@@ -515,3 +515,310 @@ fn registry_slots_are_reused_as_tasks_complete() {
     // Dropping the runtime now shuts down four parked tasks that sit in a slab
     // full of recycled and vacant slots.
 }
+
+/// Shutting a task down is polling it with cancellation already requested, so
+/// it has to work on a task that is sitting in the run queue, having never been
+/// polled at all.
+#[test]
+fn shutdown_kills_a_task_that_is_still_queued() {
+    struct OnDrop(Rc<Cell<bool>>);
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    let rt = Runtime::new();
+    let dropped = Rc::new(Cell::new(false));
+
+    let handle = {
+        // A capture, so that it is dropped even though the body never runs.
+        let guard = OnDrop(Rc::clone(&dropped));
+        rt.spawn(async move {
+            let _guard = guard;
+            future::pending::<()>().await;
+        })
+    };
+
+    // The runtime is dropped without ever draining its run queue.
+    drop(rt);
+
+    assert!(dropped.get(), "the task's future must be dropped");
+    assert!(handle.is_finished());
+}
+
+/// A future's destructor runs while its task holds the poll lock and is in no
+/// registry, and it may wake another task from there. That wake has to reach
+/// the run queue, which the shutdown loop then drains.
+#[test]
+fn a_destructor_may_wake_another_task_during_shutdown() {
+    struct WakeOnDrop(Rc<Cell<Option<std::task::Waker>>>);
+    impl Drop for WakeOnDrop {
+        fn drop(&mut self) {
+            if let Some(waker) = self.0.take() {
+                waker.wake();
+            }
+        }
+    }
+
+    /// Parks on the first poll, leaving its waker in `slot`.
+    struct ParkAndShare {
+        slot: Rc<Cell<Option<std::task::Waker>>>,
+    }
+
+    impl Future for ParkAndShare {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            self.slot.set(Some(cx.waker().clone()));
+            Poll::Pending
+        }
+    }
+
+    let rt = Runtime::new();
+    let slot: Rc<Cell<Option<std::task::Waker>>> = Rc::new(Cell::new(None));
+    let woke = Rc::new(Cell::new(false));
+
+    // The waker is spawned first so that it is shut down first, while the task
+    // it wakes is still alive.
+    let waker_task = {
+        let guard = WakeOnDrop(Rc::clone(&slot));
+        let woke = Rc::clone(&woke);
+        rt.spawn(async move {
+            let _guard = guard;
+            woke.set(true);
+            future::pending::<()>().await;
+        })
+    };
+
+    let parked = rt.spawn(ParkAndShare {
+        slot: Rc::clone(&slot),
+    });
+
+    rt.block_on(async { task::yield_now().await });
+
+    assert!(woke.get(), "both tasks must have parked");
+    drop(rt);
+
+    assert!(waker_task.is_finished());
+    assert!(parked.is_finished());
+}
+
+/// An id names a registry slot, so the slot a finished task held is handed to
+/// the next task spawned.
+#[test]
+fn ids_are_reused_once_a_task_completes() {
+    let rt = Runtime::new();
+
+    rt.block_on(async {
+        let first = task::spawn(async {});
+        let id = first.id();
+        first.await.unwrap();
+
+        let second = task::spawn(async {});
+        assert_eq!(second.id(), id);
+        second.await.unwrap();
+    });
+}
+
+/// Two runtimes may exist on one thread; each drives only its own tasks.
+#[test]
+fn two_runtimes_on_one_thread_are_independent() {
+    let a = Runtime::new();
+    let b = Runtime::new();
+
+    assert_eq!(
+        a.block_on(async { task::spawn(async { 1 }).await.unwrap() }),
+        1
+    );
+    assert_eq!(
+        b.block_on(async { task::spawn(async { 2 }).await.unwrap() }),
+        2
+    );
+    assert_eq!(
+        a.block_on(async { task::spawn(async { 3 }).await.unwrap() }),
+        3
+    );
+}
+
+/// A task's waker may only be fired while its runtime is entered, since that is
+/// how the task finds the run queue to put itself on.
+#[test]
+#[should_panic(expected = "outside of a runtime")]
+fn waking_a_task_outside_of_a_runtime_panics() {
+    struct ParkAndShare {
+        slot: Rc<Cell<Option<std::task::Waker>>>,
+    }
+
+    impl Future for ParkAndShare {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            self.slot.set(Some(cx.waker().clone()));
+            Poll::Pending
+        }
+    }
+
+    let rt = Runtime::new();
+    let slot: Rc<Cell<Option<std::task::Waker>>> = Rc::new(Cell::new(None));
+
+    let _handle = rt.spawn(ParkAndShare {
+        slot: Rc::clone(&slot),
+    });
+
+    rt.block_on(async { task::yield_now().await });
+
+    slot.take().expect("the task should have parked").wake();
+}
+
+/// Handles kept past the end of the runtime stay usable. Every task is complete
+/// by then, and nothing a complete task can be asked to do reaches the runtime.
+#[test]
+fn handles_outliving_the_runtime_are_inert() {
+    let rt = Runtime::new();
+
+    let handle: JoinHandle<()> = rt.spawn(future::pending());
+    let abort = handle.abort_handle();
+
+    rt.block_on(async { task::yield_now().await });
+    drop(rt);
+
+    assert!(handle.is_finished());
+    assert!(abort.is_finished());
+    assert_eq!(abort.id(), handle.id());
+
+    // Neither of these may go looking for a run queue.
+    abort.abort();
+    handle.abort();
+}
+
+/// A future whose destructor panics while the task is being cancelled reports
+/// the panic rather than the cancellation.
+#[test]
+fn a_panic_while_cancelling_is_reported_as_a_panic() {
+    struct PanicOnDrop;
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("drop boom");
+        }
+    }
+
+    let rt = Runtime::new();
+
+    let err = rt.block_on(async {
+        let handle: JoinHandle<()> = task::spawn(async {
+            let _guard = PanicOnDrop;
+            future::pending::<()>().await;
+        });
+
+        task::yield_now().await;
+        handle.abort();
+        handle.await.unwrap_err()
+    });
+
+    assert!(err.is_panic());
+    assert!(!err.is_cancelled());
+}
+
+/// Aborting a task that has already finished must leave its result alone.
+#[test]
+fn aborting_a_finished_task_does_nothing() {
+    let rt = Runtime::new();
+
+    rt.block_on(async {
+        let handle = task::spawn(async { 7 });
+
+        task::yield_now().await;
+        task::yield_now().await;
+        assert!(handle.is_finished());
+
+        handle.abort_handle().abort();
+        assert_eq!(handle.await.unwrap(), 7);
+    });
+}
+
+/// A task's result can only be taken once, and asking twice is a bug worth
+/// reporting rather than a silent hang.
+#[test]
+#[should_panic(expected = "polled after its result was taken")]
+fn polling_a_join_handle_after_taking_its_result_panics() {
+    let rt = Runtime::new();
+
+    rt.block_on(async {
+        let mut handle = task::spawn(async { 1 });
+        assert_eq!((&mut handle).await.unwrap(), 1);
+
+        let _ = (&mut handle).await;
+    });
+}
+
+/// A future that panics while being polled is left in the task, and has to be
+/// dropped before the panic can be stored in its place. That drop may panic in
+/// turn, and the panic already being reported is the one that wins.
+#[test]
+fn a_destructor_that_panics_after_a_failed_poll_is_swallowed() {
+    struct PanicOnPollAndDrop;
+
+    impl Future for PanicOnPollAndDrop {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            panic!("poll boom");
+        }
+    }
+
+    impl Drop for PanicOnPollAndDrop {
+        fn drop(&mut self) {
+            panic!("drop boom");
+        }
+    }
+
+    let rt = Runtime::new();
+
+    let err = rt.block_on(async {
+        let handle: JoinHandle<()> = task::spawn(PanicOnPollAndDrop);
+        handle.await.unwrap_err()
+    });
+
+    assert!(err.is_panic());
+    assert_eq!(
+        err.into_panic().downcast_ref::<&'static str>().copied(),
+        Some("poll boom"),
+        "the panic from the poll is the one reported"
+    );
+}
+
+/// A future that finishes and then panics on the way out is reported as a
+/// panic. Its result never reaches the `JoinHandle`, and the task still
+/// completes rather than being left holding the poll lock.
+#[test]
+fn a_destructor_that_panics_after_a_ready_poll_is_reported() {
+    struct PanicOnDrop;
+
+    impl Future for PanicOnDrop {
+        type Output = u32;
+
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<u32> {
+            Poll::Ready(5)
+        }
+    }
+
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("drop boom");
+        }
+    }
+
+    let rt = Runtime::new();
+
+    let err = rt.block_on(async {
+        let handle = task::spawn(PanicOnDrop);
+        handle.await.unwrap_err()
+    });
+
+    assert!(err.is_panic());
+    assert_eq!(
+        err.into_panic().downcast_ref::<&'static str>().copied(),
+        Some("drop boom")
+    );
+}

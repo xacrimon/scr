@@ -1,58 +1,37 @@
-//! Storage for the tasks spawned on a scheduler.
+//! The registry of tasks spawned on a runtime.
 //!
-//! `tokio` has two containers here: a sharded, thread-safe `OwnedTasks` and a
-//! `LocalOwnedTasks` for non-`Send` tasks. Only the latter shape is relevant
-//! for a single threaded runtime, and even that one is an intrusive doubly
-//! linked list threaded through each task's `Trailer`. That buys allocation
-//! free binding, at the cost of a fair amount of raw pointer manipulation and
-//! of a `!Unpin` dance to keep `noalias` off the link fields.
+//! Tasks live in a slab, and each one records the slot it was put in as its id.
+//! Removal is therefore a single indexed lookup, and the id a task reports is
+//! the same number the registry files it under.
 //!
-//! Here the tasks live in a `Slab` instead, and each task records the key it
-//! was inserted under in its `Trailer`. Removal stays O(1), as it was with the
-//! list, but the only pointer work left is reading a `usize` out of the
-//! trailer. Binding is no longer allocation free, though the slab amortizes
-//! that away.
-//!
-//! The collection can be closed to prevent adding new tasks during shutdown of
-//! the scheduler that owns it.
+//! The registry can be closed, which stops new tasks from being added while a
+//! runtime shuts down.
 
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::mem;
+use std::panic::Location;
+use std::ptr::NonNull;
 
 use slab::Slab;
 
-use crate::runtime::task::core::{Header, Trailer};
-use crate::runtime::task::{JoinHandle, Runnable, Schedule, SpawnLocation, Task};
+use crate::runtime::task::{Header, Id, JoinHandle, Runnable, Task, new_task};
 
-/// The key stored in a task that is not in any `OwnedTasks`.
-///
-/// A slab key is an index into a `Vec`, and a `Vec` can never hold `usize::MAX`
-/// elements, so this cannot collide with a real key. See [`OwnedTasks::remove`]
-/// for why the distinction has to be drawn.
-pub(super) const NOT_OWNED: usize = usize::MAX;
+pub(crate) struct OwnedTasks {
+    inner: UnsafeCell<Inner>,
 
-/// Returns the trailer of a task, which is where its slab key is stored.
-fn trailer<S: 'static>(task: &Task<S>) -> &Trailer {
-    // Safety: The `Task` holds a ref-count, so the allocation is live for at
-    // least as long as the borrow we return. The trailer is never borrowed
-    // mutably, so handing out a shared borrow of it is fine.
-    unsafe { Header::get_trailer(task.header_ptr()).as_ref() }
-}
-
-pub(crate) struct OwnedTasks<S: 'static> {
-    inner: UnsafeCell<Inner<S>>,
+    /// The registry is only ever touched from the thread running the runtime.
     _not_send_or_sync: PhantomData<*const ()>,
 }
 
-struct Inner<S: 'static> {
-    tasks: Slab<Task<S>>,
+struct Inner {
+    tasks: Slab<Task>,
     closed: bool,
 }
 
-impl<S: 'static> OwnedTasks<S> {
-    pub(crate) fn new() -> Self {
-        Self {
+impl OwnedTasks {
+    pub(crate) fn new() -> OwnedTasks {
+        OwnedTasks {
             inner: UnsafeCell::new(Inner {
                 tasks: Slab::new(),
                 closed: false,
@@ -61,57 +40,64 @@ impl<S: 'static> OwnedTasks<S> {
         }
     }
 
-    /// Binds a new task to this collection, returning its `JoinHandle` and,
-    /// unless the collection is closed, the `Runnable` that should be
-    /// scheduled.
+    /// Creates a task for `future` and registers it, returning its
+    /// `JoinHandle` and the `Runnable` that should be queued.
+    ///
+    /// A task bound while the registry is closed is shut down instead of
+    /// registered, and no `Runnable` is returned.
     pub(crate) fn bind<T>(
         &self,
-        task: T,
-        scheduler: S,
-        id: super::Id,
-        spawned_at: SpawnLocation,
-    ) -> (JoinHandle<T::Output>, Option<Runnable<S>>)
+        future: T,
+        spawned_at: &'static Location<'static>,
+    ) -> (JoinHandle<T::Output>, Option<Runnable>)
     where
-        S: Schedule,
         T: Future + 'static,
         T::Output: 'static,
     {
-        let (task, runnable, join) = super::new_task(task, scheduler, id, spawned_at);
+        // The slot is reserved before the task is created, because the key it
+        // hands out becomes the id baked into the allocation. Creating a task
+        // allocates but runs no user code, so it cannot re-enter the registry.
+        let bound = self.with_inner(|inner| {
+            let entry = inner.tasks.vacant_entry();
+            let (task, runnable, join) = new_task(future, Id::from_slot(entry.key()), spawned_at);
 
-        if self.is_closed() {
-            drop(runnable);
-            task.shutdown();
-            (join, None)
-        } else {
-            self.with_inner(|inner| {
-                // Reserve the slot first: inserting moves the task into the
-                // slab, so its key has to be recorded before that happens.
-                let entry = inner.tasks.vacant_entry();
-                trailer(&task).owned.set(entry.key());
-                entry.insert(task);
-            });
-            (join, Some(runnable))
+            if inner.closed {
+                return Err((task, runnable, join));
+            }
+
+            task.header().state.set_owned();
+            entry.insert(task);
+
+            Ok((join, runnable))
+        });
+
+        match bound {
+            Ok((join, runnable)) => (join, Some(runnable)),
+            Err((task, runnable, join)) => {
+                // The task will never be queued, so its `Runnable` goes away
+                // here. Shutting the task down drops the future, which runs
+                // user code and so cannot happen under the borrow above.
+                drop(runnable);
+                task.shutdown();
+
+                (join, None)
+            }
         }
     }
 
-    /// Shuts down all tasks in the collection. This call also closes the
-    /// collection, preventing new items from being added.
-    pub(crate) fn close_and_shutdown_all(&self)
-    where
-        S: Schedule,
-    {
-        // Take every task out in a single pass, marking each one as no longer
-        // owned. Shutting a task down drops its future, which runs arbitrary
-        // user code and reenters this type through `Schedule::release`, so it
-        // has to happen outside of `with_inner` and after the tasks have been
-        // marked.
+    /// Closes the registry and shuts down every task in it.
+    pub(crate) fn close_and_shutdown_all(&self) {
+        // Every task comes out in one pass, marked as registered nowhere.
+        // Shutting one down drops its future, which runs user code that can
+        // reach this type again, so it happens outside the borrow.
         let tasks = self.with_inner(|inner| {
             inner.closed = true;
 
             let tasks = mem::take(&mut inner.tasks);
             for (_, task) in &tasks {
-                trailer(task).owned.set(NOT_OWNED);
+                task.header().state.unset_owned();
             }
+
             tasks
         });
 
@@ -120,55 +106,73 @@ impl<S: 'static> OwnedTasks<S> {
         }
     }
 
-    /// Removes a task from the collection, returning the ref-count that the
-    /// collection held.
+    /// Takes a task out of the registry, handing back the reference it held.
     ///
-    /// Returns `None` if the task is not in this collection, which is not an
-    /// error: `release` runs for every task that completes, and two paths reach
-    /// it with a task that is already out. A task bound while the collection
-    /// was closed is never inserted at all, and `close_and_shutdown_all` takes
-    /// a task out before shutting it down.
-    pub(crate) fn remove(&self, task: &Task<S>) -> Option<Task<S>> {
-        let key = match trailer(task).owned.get() {
-            NOT_OWNED => return None,
-            key => key,
+    /// Returns `None` if the task is not in this registry, which is not an
+    /// error: a task bound while the registry was closed was never added, and
+    /// [`OwnedTasks::close_and_shutdown_all`] takes tasks out before shutting
+    /// them down.
+    pub(crate) fn remove(&self, header: NonNull<Header>) -> Option<Task> {
+        let slot = {
+            // Safety: the caller holds a reference, so the task is live.
+            let task = unsafe { header.as_ref() };
+
+            // Clearing the bit here is what makes this happen at most once, so
+            // only one caller ever reaches the slot below.
+            if !task.state.unset_owned() {
+                return None;
+            }
+
+            task.id.slot()
         };
 
-        self.with_inner(|inner| {
-            // A key other than the sentinel means the task is in a collection,
-            // and a task is only ever released through the scheduler stored in
-            // its own `Core`, which is the handle owning this one. So the slot
-            // is occupied, and it holds this very task.
-            let removed = inner.tasks.remove(key);
-            debug_assert_eq!(removed.header_ptr(), task.header_ptr());
-
-            // Restore the sentinel. A task is released exactly once, so
-            // nothing should read this key again; keeping the invariant
-            // uniform means that if anything ever did, it would find the
-            // sentinel rather than evict whichever task the slab hands this
-            // recycled key to next.
-            trailer(&removed).owned.set(NOT_OWNED);
-
-            Some(removed)
+        self.with_inner(|inner| match inner.tasks.get(slot) {
+            Some(task) if task.header_ptr() == header => Some(inner.tasks.remove(slot)),
+            _ => {
+                // The task belongs to another runtime, which can only happen if
+                // it was woken while this one was entered. Leaving the slot
+                // alone leaks the other runtime's entry, where evicting it
+                // would take an unrelated task down with it.
+                debug_assert!(false, "task released through the wrong runtime");
+                None
+            }
         })
     }
 
-    #[inline]
-    fn with_inner<F, T>(&self, f: F) -> T
-    where
-        F: FnOnce(&mut Inner<S>) -> T,
-    {
-        // Safety: This type is not Sync, so concurrent calls of this method
-        // can't happen. Furthermore, all uses of this method in this file make
-        // sure that they don't call `with_inner` recursively.
-        f(unsafe { &mut *self.inner.get() })
+    /// Returns `true` if the task is registered somewhere other than here.
+    pub(crate) fn is_foreign(&self, header: NonNull<Header>) -> bool {
+        // Safety: the caller holds a reference, so the task is live.
+        let task = unsafe { header.as_ref() };
+
+        // A task in no registry at all is being shut down, and belongs to
+        // whoever is doing the shutting down.
+        if !task.state.load().is_owned() {
+            return false;
+        }
+
+        self.with_inner(|inner| match inner.tasks.get(task.id.slot()) {
+            Some(task) => task.header_ptr() != header,
+            None => true,
+        })
     }
 
+    #[cfg(test)]
     pub(crate) fn is_closed(&self) -> bool {
         self.with_inner(|inner| inner.closed)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.with_inner(|inner| inner.tasks.is_empty())
+    }
+
+    #[inline]
+    fn with_inner<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce(&mut Inner) -> T,
+    {
+        // Safety: this type is not `Sync`, so two of these cannot overlap
+        // across threads, and no caller in this file runs anything that could
+        // re-enter the registry while the borrow is live.
+        f(unsafe { &mut *self.inner.get() })
     }
 }

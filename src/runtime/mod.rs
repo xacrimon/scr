@@ -4,10 +4,9 @@ pub(crate) mod task;
 
 mod blocking;
 
-use std::future::Future;
 use std::marker::PhantomData;
+use std::panic::Location;
 use std::pin::pin;
-use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use self::sched::Handle;
@@ -23,7 +22,7 @@ const EVENT_INTERVAL: u32 = 61;
 /// bound to the thread that created it. `Runtime` is therefore neither `Send`
 /// nor `Sync`.
 pub struct Runtime {
-    handle: Rc<Handle>,
+    handle: Handle,
 
     /// The runtime is thread affine; see the task module docs.
     _not_send_or_sync: PhantomData<*const ()>,
@@ -48,7 +47,10 @@ impl Runtime {
         F: Future + 'static,
         F::Output: 'static,
     {
-        Handle::spawn(&self.handle, future)
+        let spawned_at = Location::caller();
+        let _enter = context::enter(&self.handle);
+
+        self.handle.spawn(future, spawned_at)
     }
 
     /// Runs a future to completion, driving any spawned tasks in the meantime.
@@ -60,7 +62,7 @@ impl Runtime {
     /// thread, nothing could ever wake the future at that point, so this would
     /// otherwise be a silent hang.
     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
-        let _enter = context::enter_runtime(&self.handle);
+        let _enter = context::enter(&self.handle);
 
         let mut future = pin!(future);
         let signal = blocking::Signal::new();
@@ -78,7 +80,7 @@ impl Runtime {
             let mut ran = false;
 
             for _ in 0..EVENT_INTERVAL {
-                let Some(task) = self.handle.queue.pop() else {
+                let Some(task) = self.handle.next_task() else {
                     break;
                 };
 
@@ -102,13 +104,17 @@ impl Runtime {
 }
 
 impl Default for Runtime {
-    fn default() -> Self {
+    fn default() -> Runtime {
         Runtime::new()
     }
 }
 
 impl Drop for Runtime {
     fn drop(&mut self) {
+        // Shutting the tasks down drops their futures, whose destructors can
+        // wake other tasks, so the runtime has to be entered for it.
+        let _enter = context::enter(&self.handle);
+
         self.handle.shutdown();
     }
 }

@@ -1,261 +1,130 @@
-//! The task module.
+//! Spawned tasks.
 //!
-//! The task module contains the code that manages spawned tasks and provides a
-//! safe API for the rest of the runtime to use. Each task in a runtime is
-//! stored in an `OwnedTasks` object.
+//! A task is a future the runtime owns, together with everything needed to
+//! drive it: a state word, a reference count, a slot for the future and then
+//! for its result, and a vtable so that the runtime can handle any future at
+//! all through a single pointer.
 //!
-//! This is a translation of `tokio`'s task module for a runtime that is single
-//! threaded by construction. The differences worth knowing about are collected
-//! in the "Single threaded" section below.
+//! # References
 //!
-//! # Task reference types
+//! A task lives in one heap allocation, kept alive by the reference count in
+//! its state word. There are four kinds of reference:
 //!
-//! A task is usually referenced by multiple handles, and there are several
-//! types of handles.
-//!
-//!  * `Task` - the reference stored in the `OwnedTasks` collection that owns
-//!    the task.
-//!
-//!  * `JoinHandle` - each task has a `JoinHandle` that allows access to the
-//!    output of the task.
-//!
-//!  * `Waker` - every waker for a task has this reference type. There can be any
-//!    number of waker references.
-//!
-//!  * `Runnable` - the unique permission to poll the task, and the token that
-//!    sits in the run queue.
-//!
-//! The task uses a reference count to keep track of how many active references
-//! exist. Each reference type takes up a single ref-count.
-//!
-//! Besides the waker type, each task has at most one of each reference type.
+//!  * [`Task`] — the registry's, held from the moment the task is spawned
+//!    until it completes.
+//!  * [`Runnable`] — the permission to poll the task, and the token that sits
+//!    in the run queue. At most one exists at a time, which is what stops a
+//!    task from being queued twice.
+//!  * [`JoinHandle`] — the permission to await the task's result. At most one.
+//!  * [`AbortHandle`] and `Waker` — any number of either.
 //!
 //! # State
 //!
-//! The task stores its state in a `Cell<usize>` with various bitfields for the
-//! necessary information. The state has the following bitfields:
+//! The state word packs the reference count with six flags:
 //!
-//!  * `RUNNING` - Tracks whether the task is currently being polled or cancelled.
-//!    This bit functions as a lock around the task.
+//!  * `RUNNING` — the task is being polled. Acts as a lock over the slot
+//!    holding the future or its result.
+//!  * `COMPLETE` — the future has finished and its result has been stored.
+//!    Never unset, and never set at the same time as `RUNNING`.
+//!  * `NOTIFIED` — a `Runnable` for this task exists.
+//!  * `JOIN_INTEREST` — a `JoinHandle` for this task exists.
+//!  * `CANCELLED` — the task should be killed at the next opportunity.
+//!  * `OWNED` — the task is in the registry, in the slot named by its id.
 //!
-//!  * `COMPLETE` - Is one once the future has fully completed and has been
-//!    dropped. Never unset once set. Never set together with RUNNING.
+//! # Access to the slot
 //!
-//!  * `NOTIFIED` - Tracks whether a `Runnable` currently exists.
+//! While `COMPLETE` is unset, the slot holding the future belongs to whoever
+//! holds `RUNNING`. Once `COMPLETE` is set, it holds the result, and belongs to
+//! the `JoinHandle`; if there is none, the poll that completed the task drops
+//! the result on its way out.
 //!
-//!  * `CANCELLED` - Is set to one for tasks that should be cancelled as soon as
-//!    possible. May take any value for completed tasks.
+//! The waker of whoever is awaiting the task belongs to the `JoinHandle` for as
+//! long as `JOIN_INTEREST` is set. The runtime reads it once, on completion,
+//! which cannot overlap with the `JoinHandle` writing it because both happen on
+//! the same thread.
 //!
-//!  * `JOIN_INTEREST` - Is set to one if there exists a `JoinHandle`.
+//! Everything else in a task is written once, when it is created.
 //!
-//! The rest of the bits are used for the ref-count.
+//! # Thread affinity
 //!
-//! # Fields in the task
+//! Every task is polled and dropped on the thread that owns the runtime, so the
+//! state word is a plain `Cell<usize>` and no task type is `Send` or `Sync`.
+//! That makes a `Waker` for one of these tasks thread affine as well: waking
+//! from another thread would race on the reference count. The runtime must
+//! never hand a waker to anything that could move it off this thread.
 //!
-//! The task has various fields. This section describes how and when it is safe
-//! to access a field.
+//! # Re-entrancy
 //!
-//!  * The `owned` field holds the key the task is stored under in the
-//!    `OwnedTasks` that owns it. It is written only by that collection, under
-//!    the borrow it takes of its own interior.
-//!
-//!  * If COMPLETE is one, then the `JoinHandle` has exclusive access to the
-//!    stage field. If COMPLETE is zero, then the RUNNING bitfield functions as
-//!    a lock for the stage field, and it can be accessed only by the caller
-//!    that set RUNNING to one.
-//!
-//!  * The waker field is owned by the `JoinHandle` for as long as
-//!    `JOIN_INTEREST` is set. The runtime reads it once, during completion,
-//!    which cannot overlap with a `JoinHandle` poll because both happen on the
-//!    same thread. See the "Single threaded" section.
-//!
-//! All other fields are immutable and can be accessed immutably without
-//! synchronization by anyone.
-//!
-//! # Single threaded
-//!
-//! This runtime polls every task, and drops every task, on the thread that owns
-//! the runtime. That removes the need for several mechanisms that `tokio` needs:
-//!
-//!  * The task state is a `Cell<usize>` instead of an `AtomicUsize`, and every
-//!    transition is a load/modify/store instead of a CAS loop.
-//!
-//!  * The `JOIN_WAKER` bit is gone. In `tokio` it is an access control bit that
-//!    arbitrates between a `JoinHandle` writing the waker field on one thread
-//!    and the runtime reading it on another. Here those two events are ordered
-//!    by being on the same thread, so the waker field is a plain `Option<Waker>`
-//!    that the `JoinHandle` owns until it unsets `JOIN_INTEREST`.
-//!
-//!  * The token that goes in the run queue is called `Runnable`, and there is
-//!    one of it. `tokio` splits it in two: a `Notified` that is safe to hand to
-//!    a scheduler, and a `LocalNotified` that is safe to poll on this thread.
-//!    Every task here is polled on the thread that owns it, so the distinction
-//!    collapses. There is also no `UnownedTask`, because there are no blocking
-//!    tasks.
-//!
-//!  * `OwnedTasks` is a `Slab` rather than an intrusive doubly linked list, so
-//!    the `owned` field of the `Trailer` is a slab key rather than a pair of
-//!    link pointers. See the docs on that module.
-//!
-//!  * There is no `owner_id`. `tokio` stamps each task with the id of the
-//!    `OwnedTasks` holding it, both to tell "in no list" from "sole element of
-//!    a list" and to catch a task being released through the wrong runtime.
-//!    Neither is needed here: a task not in a collection holds the `NOT_OWNED`
-//!    sentinel as its key, and a task is only ever released through the
-//!    scheduler in its own `Core`, so the wrong-runtime case cannot arise.
-//!    Dropping the field also removed the last atomic in the crate, the counter
-//!    that generated those ids.
-//!
-//!  * No task type implements `Send` or `Sync`.
-//!
-//! Note that this makes a `Waker` for one of these tasks thread-affine: waking
-//! from another thread would race on the non-atomic ref-count. The runtime is
-//! responsible for never handing a waker to something that could move it to
-//! another thread.
-//!
-//! # Safety
-//!
-//! This section goes through various situations and explains why the API is
-//! safe in that situation.
-//!
-//! ## Polling or dropping the future
-//!
-//! Any mutable access to the future happens after obtaining a lock by modifying
-//! the RUNNING field, so exclusive access is ensured.
-//!
-//! When the task completes, exclusive access to the output is transferred to
-//! the `JoinHandle`. If the `JoinHandle` is already dropped when the transition
-//! to complete happens, the caller performing that transition retains exclusive
-//! access to the output and should immediately drop it.
-//!
-//! ## Recursive poll/shutdown
-//!
-//! Calling poll from inside a shutdown call or vice-versa is not prevented by
-//! the API exposed by the task module, so this has to be safe. In either case,
-//! the lock in the RUNNING bitfield makes the inner call return immediately. If
-//! the inner call is a `shutdown` call, then the CANCELLED bit is set, and the
-//! poll call will notice it when the poll finishes, and the task is cancelled
-//! at that point.
+//! Polling a task from inside its own poll, or shutting it down from there, is
+//! not prevented by this API, so it has to be safe. The `RUNNING` lock makes
+//! the inner call return immediately. If that inner call was a shutdown, it
+//! leaves `CANCELLED` set, and the poll in progress kills the task when it
+//! returns.
 
 mod abort;
-pub use self::abort::AbortHandle;
-
-mod core;
-use self::core::Cell;
-use self::core::Header;
-
 mod error;
-pub use self::error::JoinError;
-
-mod harness;
-use self::harness::Harness;
-
 mod id;
-pub use self::id::{Id, id, try_id};
-
 mod join;
-pub use self::join::JoinHandle;
-
 mod owned;
-pub(crate) use self::owned::OwnedTasks;
-
 mod raw;
-pub(crate) use self::raw::RawTask;
-
 mod state;
-use self::state::State;
-
 mod waker;
 
-use std::marker::PhantomData;
+pub use self::abort::AbortHandle;
+pub use self::error::JoinError;
+pub use self::id::{Id, id, try_id};
+pub use self::join::JoinHandle;
+
+pub(crate) use self::owned::OwnedTasks;
+pub(crate) use self::raw::{Header, RawTask};
+
+use std::fmt;
+use std::mem;
 use std::panic::Location;
 use std::ptr::NonNull;
-use std::{fmt, mem};
 
-/// An owned handle to the task, tracked by ref count.
-#[repr(transparent)]
-pub(crate) struct Task<S: 'static> {
-    raw: RawTask,
-    _p: PhantomData<S>,
-}
-
-/// The unique permission to poll a task, and the token that sits in the run
-/// queue.
-///
-/// At most one exists for a task at a time, and the `NOTIFIED` bit tracks
-/// whether one is outstanding. Waking a task mints one only if that bit was
-/// clear, which is what keeps a task from being queued twice.
-#[repr(transparent)]
-pub(crate) struct Runnable<S: 'static>(Task<S>);
-
-/// Task result sent back.
+/// What awaiting a task yields: its output, or why it never produced one.
 pub(crate) type Result<T> = std::result::Result<T, JoinError>;
 
-pub(crate) trait Schedule: Sized + 'static {
-    /// The task has completed work and is ready to be released. The scheduler
-    /// should release it immediately and return it. The task module will batch
-    /// the ref-dec with setting other options.
-    ///
-    /// If the scheduler has already released the task, then None is returned.
-    fn release(&self, task: &Task<Self>) -> Option<Task<Self>>;
-
-    /// Schedule the task.
-    fn schedule(&self, runnable: Runnable<Self>);
-
-    /// Schedule the task to run in the near future, yielding the thread to
-    /// other tasks.
-    fn yield_now(&self, runnable: Runnable<Self>) {
-        self.schedule(runnable);
-    }
-
-    /// Polling the task resulted in a panic. Should the runtime shutdown?
-    fn unhandled_panic(&self) {
-        // By default, do nothing.
-    }
+/// The registry's reference to a task.
+#[repr(transparent)]
+pub(crate) struct Task {
+    raw: RawTask,
 }
 
-/// This is the constructor for a new task. Three references to the task are
-/// created. The first task reference is usually put into an `OwnedTasks`
-/// immediately. The `Runnable` is sent to the scheduler as an ordinary
-/// notification.
-fn new_task<T, S>(
-    task: T,
-    scheduler: S,
+/// The permission to poll a task, and the token that sits in the run queue.
+///
+/// The `NOTIFIED` flag records whether one of these is outstanding. Waking a
+/// task mints one only if that flag was clear, so a task is never queued twice.
+#[repr(transparent)]
+pub(crate) struct Runnable(Task);
+
+/// Creates a task holding `future`, along with the three references it starts
+/// with: the registry's, the run queue's, and the caller's `JoinHandle`.
+fn new_task<T>(
+    future: T,
     id: Id,
-    spawned_at: SpawnLocation,
-) -> (Task<S>, Runnable<S>, JoinHandle<T::Output>)
+    spawned_at: &'static Location<'static>,
+) -> (Task, Runnable, JoinHandle<T::Output>)
 where
-    S: Schedule,
     T: Future + 'static,
     T::Output: 'static,
 {
-    let raw = RawTask::new::<T, S>(task, scheduler, id, spawned_at);
-    let task = Task {
-        raw,
-        _p: PhantomData,
-    };
-    let runnable = Runnable(Task {
-        raw,
-        _p: PhantomData,
-    });
-    let join = JoinHandle::new(raw);
+    let raw = RawTask::new(future, id, spawned_at);
 
-    (task, runnable, join)
+    (Task { raw }, Runnable(Task { raw }), JoinHandle::new(raw))
 }
 
-impl<S: 'static> Task<S> {
-    unsafe fn new(raw: RawTask) -> Task<S> {
-        Task {
-            raw,
-            _p: PhantomData,
-        }
-    }
-
+impl Task {
     /// # Safety
     ///
-    /// `ptr` must be a valid pointer to a [`Header`].
-    unsafe fn from_raw(ptr: NonNull<Header>) -> Task<S> {
-        unsafe { Task::new(RawTask::from_raw(ptr)) }
+    /// `ptr` must point at a live task, and the caller must own a reference to
+    /// it to hand over.
+    unsafe fn from_raw(ptr: NonNull<Header>) -> Task {
+        Task {
+            // Safety: forwarded to the caller.
+            raw: unsafe { RawTask::from_raw(ptr) },
+        }
     }
 
     fn header(&self) -> &Header {
@@ -266,93 +135,43 @@ impl<S: 'static> Task<S> {
         self.raw.header_ptr()
     }
 
-    /// Returns a [task ID] that uniquely identifies this task relative to other
-    /// currently spawned tasks.
-    ///
-    /// [task ID]: crate::task::Id
-    #[allow(dead_code)]
-    pub(crate) fn id(&self) -> Id {
-        // Safety: The header pointer is valid.
-        unsafe { Header::get_id(self.raw.header_ptr()) }
-    }
-
-    /// Returns the source code location where this task was spawned.
-    #[allow(dead_code)]
-    pub(crate) fn spawned_at(&self) -> &'static Location<'static> {
-        // Safety: The header pointer is valid.
-        unsafe { Header::get_spawn_location(self.raw.header_ptr()) }
-    }
-}
-
-impl<S: 'static> Runnable<S> {
-    /// Returns a [task ID] that uniquely identifies this task relative to other
-    /// currently spawned tasks.
-    ///
-    /// [task ID]: crate::task::Id
-    #[allow(dead_code)]
-    pub(crate) fn id(&self) -> Id {
-        self.0.id()
-    }
-}
-
-impl<S: Schedule> Task<S> {
-    /// Preemptively cancels the task as part of the shutdown process.
+    /// Kills the task, consuming the registry's reference.
     pub(crate) fn shutdown(self) {
         let raw = self.raw;
         mem::forget(self);
+
         raw.shutdown();
     }
 }
 
-impl<S: Schedule> Runnable<S> {
-    /// Runs the task.
+impl Runnable {
+    /// Polls the task, consuming the permission to do so.
     pub(crate) fn run(self) {
         let raw = self.0.raw;
         mem::forget(self);
+
         raw.poll();
     }
+
+    pub(crate) fn header_ptr(&self) -> NonNull<Header> {
+        self.0.header_ptr()
+    }
 }
 
-impl<S: 'static> Drop for Task<S> {
+impl Drop for Task {
     fn drop(&mut self) {
-        // Decrement the ref count
-        if self.header().state.ref_dec() {
-            // Deallocate if this is the final ref count
-            self.raw.dealloc();
-        }
+        self.raw.drop_reference();
     }
 }
 
-impl<S> fmt::Debug for Task<S> {
+impl fmt::Debug for Task {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(fmt, "Task({:p})", self.header())
+        self.header().fmt(fmt)
     }
 }
 
-impl<S> fmt::Debug for Runnable<S> {
+impl fmt::Debug for Runnable {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(fmt, "task::Runnable({:p})", self.0.header())
-    }
-}
-
-/// Wrapper around [`std::panic::Location`] for the source code location where a
-/// task was spawned.
-///
-/// Unlike `tokio`, spawn locations are always captured: there is no
-/// `tokio_unstable`-style cfg gating them out.
-#[derive(Copy, Clone)]
-pub(crate) struct SpawnLocation(pub(crate) &'static Location<'static>);
-
-impl From<&'static Location<'static>> for SpawnLocation {
-    fn from(location: &'static Location<'static>) -> Self {
-        Self(location)
-    }
-}
-
-impl SpawnLocation {
-    #[track_caller]
-    #[inline]
-    pub(crate) fn capture() -> Self {
-        Self::from(Location::caller())
+        self.0.fmt(fmt)
     }
 }

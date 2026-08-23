@@ -1,64 +1,36 @@
-use crate::runtime::context;
-
-use std::cell::Cell;
 use std::fmt;
 use std::num::NonZeroU32;
 
-/// An opaque ID that uniquely identifies a task relative to all other currently
-/// running tasks.
+use crate::runtime::context;
+
+/// An opaque id that identifies a task among those currently live on its
+/// runtime.
 ///
-/// A task's ID may be re-used for another task only once *both* of the
-/// following happen:
-/// 1. The task itself exits.
-/// 2. There is no active [`JoinHandle`] associated with this task.
-///
-/// [`JoinHandle`]: crate::task::JoinHandle
+/// An id names the slot the task holds in its runtime's registry, so it is
+/// handed to a new task once the task that held it completes. Two tasks that
+/// are alive at the same time never share one.
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, PartialOrd, Ord)]
 pub struct Id {
     v: NonZeroU32,
 }
 
-/// Returns the [`Id`] of the currently running task.
-///
-/// # Panics
-///
-/// This function panics if called from outside a task. Note that calls to
-/// `block_on` do not have task IDs, so the method will panic if called from
-/// within a call to `block_on`. For a version of this function that doesn't
-/// panic, see [`try_id`].
-#[track_caller]
-pub fn id() -> Id {
-    context::current_task_id().expect("Can't get a task id when not inside a task")
-}
-
-/// Returns the [`Id`] of the currently running task, or `None` if called
-/// outside of a task.
-#[track_caller]
-pub fn try_id() -> Option<Id> {
-    context::current_task_id()
-}
-
 impl Id {
-    /// Returns the next task ID.
-    ///
-    /// The counter is thread local: every runtime lives on exactly one thread,
-    /// so a plain `Cell` is enough and no atomic RMW is needed on the spawn
-    /// path. IDs are therefore only unique within a thread.
-    pub(crate) fn next() -> Self {
-        thread_local! {
-            static NEXT_ID: Cell<u32> = const { Cell::new(1) };
-        }
+    /// Returns the id naming registry slot `slot`.
+    pub(crate) fn from_slot(slot: usize) -> Id {
+        // Ids are one based so that `Option<Id>` is the size of an `Id`. The
+        // cast is the only part that can fail, and only with more live tasks
+        // than a `u32` can count.
+        let v = u32::try_from(slot)
+            .ok()
+            .and_then(|slot| NonZeroU32::new(slot.wrapping_add(1)))
+            .expect("too many live tasks");
 
-        NEXT_ID.with(|next| {
-            loop {
-                let id = next.get();
-                next.set(id.wrapping_add(1));
+        Id { v }
+    }
 
-                if let Some(v) = NonZeroU32::new(id) {
-                    return Id { v };
-                }
-            }
-        })
+    /// Returns the registry slot this id names.
+    pub(crate) fn slot(self) -> usize {
+        self.v.get() as usize - 1
     }
 }
 
@@ -66,4 +38,22 @@ impl fmt::Display for Id {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.v.fmt(f)
     }
+}
+
+/// Returns the [`Id`] of the currently running task.
+///
+/// # Panics
+///
+/// Panics if called from outside a task. The future passed to `block_on` is not
+/// a task, so this panics there too; use [`try_id`] for a version that does
+/// not.
+#[track_caller]
+pub fn id() -> Id {
+    try_id().expect("called `task::id` from outside of a task")
+}
+
+/// Returns the [`Id`] of the currently running task, or `None` if called from
+/// outside a task.
+pub fn try_id() -> Option<Id> {
+    context::current_task_id()
 }

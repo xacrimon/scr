@@ -1,20 +1,21 @@
+use std::cell::Cell;
+use std::marker::PhantomData;
+use std::ptr::NonNull;
+
 use crate::runtime::sched::Handle;
 use crate::runtime::task::Id;
 
-use std::cell::Cell;
-use std::rc::Rc;
-
 struct Context {
     /// The runtime the current thread is entered into, if any.
-    handle: Cell<Option<Rc<Handle>>>,
+    handle: Cell<Option<NonNull<Handle>>>,
 
     /// The task currently being polled, if any.
     current_task_id: Cell<Option<Id>>,
 }
 
 impl Context {
-    const fn empty() -> Self {
-        Self {
+    const fn empty() -> Context {
+        Context {
             handle: Cell::new(None),
             current_task_id: Cell::new(None),
         }
@@ -25,46 +26,56 @@ thread_local! {
     static CONTEXT: Context = const { Context::empty() };
 }
 
-/// Sets the task id of the task currently being polled, returning the previous
-/// value so that the caller can restore it.
-pub(crate) fn set_current_task_id(id: Option<Id>) -> Option<Id> {
-    CONTEXT.with(|ctx| ctx.current_task_id.replace(id))
-}
-
-/// Returns the id of the task currently being polled, if any.
-pub(crate) fn current_task_id() -> Option<Id> {
-    CONTEXT.with(|ctx| ctx.current_task_id.get())
-}
-
-/// Returns a handle to the runtime the current thread is entered into.
+/// Runs `f` with the runtime the current thread is entered into.
 ///
 /// # Panics
 ///
-/// Panics if called from outside of a runtime.
-pub(crate) fn current_handle() -> Rc<Handle> {
-    CONTEXT.with(|ctx| {
-        let handle = ctx.handle.take().unwrap();
-        let cloned = handle.clone();
-        ctx.handle.set(Some(handle));
-        cloned
-    })
+/// Panics if the current thread is not inside a runtime. A task's wakers and
+/// abort handles may only be used while the runtime that owns the task is
+/// entered, which the runtime is for the whole of `block_on`, `spawn` and its
+/// own shutdown.
+#[track_caller]
+pub(crate) fn with_handle<R>(f: impl FnOnce(&Handle) -> R) -> R {
+    let handle = CONTEXT
+        .with(|ctx| ctx.handle.get())
+        .expect("called from outside of a runtime");
+
+    // Safety: the pointer was installed by `enter`, whose guard borrows the
+    // runtime it points at and is still alive.
+    f(unsafe { handle.as_ref() })
+}
+
+/// Enters `handle` until the returned guard is dropped, so that spawning and
+/// waking can find it.
+pub(crate) fn enter(handle: &Handle) -> EnterGuard<'_> {
+    let prev = CONTEXT.with(|ctx| ctx.handle.replace(Some(NonNull::from(handle))));
+
+    EnterGuard {
+        prev,
+        _p: PhantomData,
+    }
 }
 
 /// Restores the previously entered runtime, if any, when dropped.
 #[must_use]
-pub(crate) struct EnterGuard {
-    prev: Option<Rc<Handle>>,
+pub(crate) struct EnterGuard<'a> {
+    prev: Option<NonNull<Handle>>,
+    _p: PhantomData<&'a Handle>,
 }
 
-impl Drop for EnterGuard {
+impl Drop for EnterGuard<'_> {
     fn drop(&mut self) {
-        let prev = self.prev.take();
-        CONTEXT.with(|ctx| ctx.handle.set(prev));
+        CONTEXT.with(|ctx| ctx.handle.set(self.prev));
     }
 }
 
-/// Enters the runtime, so that `spawn` and friends can find it.
-pub(crate) fn enter_runtime(handle: &Rc<Handle>) -> EnterGuard {
-    let prev = CONTEXT.with(|ctx| ctx.handle.replace(Some(Rc::clone(handle))));
-    EnterGuard { prev }
+/// Sets the id of the task being polled, returning the previous value so that
+/// the caller can restore it.
+pub(crate) fn set_current_task_id(id: Option<Id>) -> Option<Id> {
+    CONTEXT.with(|ctx| ctx.current_task_id.replace(id))
+}
+
+/// Returns the id of the task being polled, if any.
+pub(crate) fn current_task_id() -> Option<Id> {
+    CONTEXT.with(|ctx| ctx.current_task_id.get())
 }

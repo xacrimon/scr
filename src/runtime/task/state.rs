@@ -1,104 +1,90 @@
 use std::cell::Cell;
 use std::fmt;
 
-/// The task state.
+/// The task state: lifecycle flags packed alongside a reference count.
 ///
-/// Unlike `tokio`, this is a plain `Cell<usize>` rather than an `AtomicUsize`:
-/// a task is only ever touched from the thread that owns the runtime, so every
-/// transition is a load, a bit of arithmetic and a store. There are no CAS
-/// loops, which means each transition below reads as straight-line code.
+/// A task is only ever touched from the thread that owns the runtime, so this
+/// is a plain `Cell<usize>`. Every transition below is a load, some arithmetic
+/// and a store; none of them can lose a race and have to be retried, so each
+/// one reads as straight-line code.
 pub(super) struct State {
     val: Cell<usize>,
 }
 
-/// Current state value.
+/// A state value read out of a [`State`].
 #[derive(Copy, Clone)]
 pub(super) struct Snapshot(usize);
 
-/// The task is currently being run.
-const RUNNING: usize = 0b0001;
+/// The task is being polled. Acts as a lock over the stage field.
+const RUNNING: usize = 0b00_0001;
 
-/// The task is complete.
-///
-/// Once this bit is set, it is never unset.
-const COMPLETE: usize = 0b0010;
+/// The future has finished and its result has been stored. Never unset.
+const COMPLETE: usize = 0b00_0010;
 
-/// Extracts the task's lifecycle value from the state.
-const LIFECYCLE_MASK: usize = 0b11;
+/// A `Runnable` for this task exists, so it must not be queued a second time.
+const NOTIFIED: usize = 0b00_0100;
 
-/// Flag tracking if the task has been pushed into a run queue.
-const NOTIFIED: usize = 0b100;
+/// A `JoinHandle` for this task exists.
+const JOIN_INTEREST: usize = 0b00_1000;
 
-/// The join handle is still around.
-const JOIN_INTEREST: usize = 0b1_000;
+/// The task should be cancelled at the next opportunity. Meaningless once
+/// `COMPLETE` is set.
+const CANCELLED: usize = 0b01_0000;
 
-/// The task has been forcibly cancelled.
-const CANCELLED: usize = 0b10_000;
+/// The task is registered in an `OwnedTasks`, in the slot named by its id.
+const OWNED: usize = 0b10_0000;
 
-/// All bits.
-const STATE_MASK: usize = LIFECYCLE_MASK | NOTIFIED | JOIN_INTEREST | CANCELLED;
+/// Every bit that is not part of the reference count.
+const STATE_MASK: usize = RUNNING | COMPLETE | NOTIFIED | JOIN_INTEREST | CANCELLED | OWNED;
 
-/// Bits used by the ref count portion of the state.
+/// Bits holding the reference count.
 const REF_COUNT_MASK: usize = !STATE_MASK;
 
-/// Number of positions to shift the ref count.
+/// How far the reference count is shifted up.
 const REF_COUNT_SHIFT: usize = REF_COUNT_MASK.count_zeros() as usize;
 
-/// One ref count.
+/// One reference.
 const REF_ONE: usize = 1 << REF_COUNT_SHIFT;
 
-/// State a task is initialized with.
+/// The state a task is created with.
 ///
-/// A task is initialized with three references:
-///
-///  * A reference that will be stored in an `OwnedTasks`.
-///  * A reference that will be sent to the scheduler as an ordinary notification.
-///  * A reference for the `JoinHandle`.
-///
-/// As the task starts with a `JoinHandle`, `JOIN_INTEREST` is set.
-/// As the task starts with a `Runnable`, `NOTIFIED` is set.
+/// It starts with three references: one for the `OwnedTasks` it is about to be
+/// registered in, one for the `Runnable` handed to the run queue, and one for
+/// the `JoinHandle`. The latter two are reflected in `NOTIFIED` and
+/// `JOIN_INTEREST`; `OWNED` is set by the registry once the task is in it.
 const INITIAL_STATE: usize = (REF_ONE * 3) | JOIN_INTEREST | NOTIFIED;
 
+/// The outcome of taking the poll lock.
 #[must_use]
 pub(super) enum TransitionToRunning {
-    Success,
+    /// The lock was taken; poll the future.
+    Polled,
+    /// The lock was taken, but the task has been cancelled; kill it instead.
     Cancelled,
-    Failed,
-    Dealloc,
+    /// The task is already running or already complete. Drop the reference.
+    Dead,
 }
 
+/// The outcome of releasing the poll lock after a `Pending` poll.
 #[must_use]
 pub(super) enum TransitionToIdle {
-    Ok,
-    OkNotified,
-    OkDealloc,
+    /// Nothing happened during the poll. Drop the reference.
+    Idle,
+    /// The task was woken while it was being polled. A reference for a fresh
+    /// `Runnable` has been added; queue it and then drop the caller's own.
+    Notified,
+    /// The task was cancelled while it was being polled. Kill it.
     Cancelled,
-}
-
-#[must_use]
-pub(super) enum TransitionToNotifiedByVal {
-    DoNothing,
-    Submit,
-    Dealloc,
-}
-
-#[must_use]
-pub(super) enum TransitionToNotifiedByRef {
-    DoNothing,
-    Submit,
 }
 
 impl State {
-    /// Returns a task's initial state.
+    /// Returns the state a new task starts in.
     pub(super) fn new() -> State {
-        // The raw task returned by this method has a ref-count of three. See
-        // the comment on INITIAL_STATE for more.
         State {
             val: Cell::new(INITIAL_STATE),
         }
     }
 
-    /// Loads the current state.
     #[inline]
     pub(super) fn load(&self) -> Snapshot {
         Snapshot(self.val.get())
@@ -109,42 +95,31 @@ impl State {
         self.val.set(snapshot.0);
     }
 
-    /// Attempts to transition the lifecycle to `Running`. This sets the
-    /// notified bit to false so notifications during the poll can be detected.
+    /// Takes the poll lock, consuming the reference that grants the right to
+    /// poll. That reference is held by a `Runnable`, or by the registry when a
+    /// task is being shut down.
+    ///
+    /// `NOTIFIED` is cleared so that wakes arriving during the poll can be
+    /// told apart from the one that led here.
     pub(super) fn transition_to_running(&self) -> TransitionToRunning {
         let mut next = self.load();
-        debug_assert!(next.is_notified());
 
         if !next.is_idle() {
-            // This happens if the task is either currently running or if it
-            // has already completed, e.g. if it was cancelled during
-            // shutdown. Consume the ref-count and return.
-            next.ref_dec();
-            self.store(next);
+            return TransitionToRunning::Dead;
+        }
 
-            if next.ref_count() == 0 {
-                TransitionToRunning::Dealloc
-            } else {
-                TransitionToRunning::Failed
-            }
+        next.set_running();
+        next.unset_notified();
+        self.store(next);
+
+        if next.is_cancelled() {
+            TransitionToRunning::Cancelled
         } else {
-            // We are able to lock the RUNNING bit.
-            next.set_running();
-            next.unset_notified();
-            self.store(next);
-
-            if next.is_cancelled() {
-                TransitionToRunning::Cancelled
-            } else {
-                TransitionToRunning::Success
-            }
+            TransitionToRunning::Polled
         }
     }
 
-    /// Transitions the task from `Running` -> `Idle`.
-    ///
-    /// The transition to `Idle` fails if the task has been flagged to be
-    /// cancelled.
+    /// Releases the poll lock after the future returned `Pending`.
     pub(super) fn transition_to_idle(&self) -> TransitionToIdle {
         let mut next = self.load();
         debug_assert!(next.is_running());
@@ -155,202 +130,102 @@ impl State {
 
         next.unset_running();
 
-        if !next.is_notified() {
-            // Polling the future consumes the ref-count of the `Runnable`.
-            next.ref_dec();
-            self.store(next);
-
-            if next.ref_count() == 0 {
-                TransitionToIdle::OkDealloc
-            } else {
-                TransitionToIdle::Ok
-            }
-        } else {
-            // The caller will schedule a new notification, so we create a new
-            // ref-count for the notification. Our own ref-count is kept for
-            // now, and the caller will drop it shortly.
+        if next.is_notified() {
             next.ref_inc();
             self.store(next);
-
-            TransitionToIdle::OkNotified
+            TransitionToIdle::Notified
+        } else {
+            self.store(next);
+            TransitionToIdle::Idle
         }
     }
 
-    /// Transitions the task from `Running` -> `Complete`.
+    /// Marks the task complete, returning the state it settled in.
     pub(super) fn transition_to_complete(&self) -> Snapshot {
-        const DELTA: usize = RUNNING | COMPLETE;
+        let mut next = self.load();
+        debug_assert!(next.is_running());
+        debug_assert!(!next.is_complete());
 
-        let prev = self.load();
-        debug_assert!(prev.is_running());
-        debug_assert!(!prev.is_complete());
-
-        let next = Snapshot(prev.0 ^ DELTA);
+        next.unset_running();
+        next.set_complete();
         self.store(next);
 
         next
     }
 
-    /// Transitions from `Complete` -> `Terminal`, decrementing the reference
-    /// count the specified number of times.
+    /// Drops `count` references at once, returning `true` if that was the last
+    /// of them and the task should be deallocated.
     ///
-    /// Returns true if the task should be deallocated.
+    /// Completion releases the references held by the registry and by the
+    /// `Runnable` together, and must not let the task be deallocated part way
+    /// through.
     pub(super) fn transition_to_terminal(&self, count: usize) -> bool {
         let prev = self.load();
-        assert!(
-            prev.ref_count() >= count,
-            "current: {}, sub: {}",
-            prev.ref_count(),
-            count
-        );
+        debug_assert!(prev.ref_count() >= count);
 
         self.store(Snapshot(prev.0 - count * REF_ONE));
 
         prev.ref_count() == count
     }
 
-    /// Transitions the state to `NOTIFIED`.
-    ///
-    /// If no task needs to be submitted, a ref-count is consumed.
-    ///
-    /// If a task needs to be submitted, the ref-count is incremented for the
-    /// new `Runnable`.
-    pub(super) fn transition_to_notified_by_val(&self) -> TransitionToNotifiedByVal {
-        let mut next = self.load();
-
-        if next.is_running() {
-            // If the task is running, we mark it as notified, but we should
-            // not submit anything as the poll currently in progress is
-            // responsible for that.
-            next.set_notified();
-            next.ref_dec();
-
-            // The caller that set the running bit also holds a ref-count.
-            debug_assert!(next.ref_count() > 0);
-            self.store(next);
-
-            TransitionToNotifiedByVal::DoNothing
-        } else if next.is_complete() || next.is_notified() {
-            // We do not need to submit any notifications, but we have to
-            // decrement the ref-count.
-            next.ref_dec();
-            self.store(next);
-
-            if next.ref_count() == 0 {
-                TransitionToNotifiedByVal::Dealloc
-            } else {
-                TransitionToNotifiedByVal::DoNothing
-            }
-        } else {
-            // We create a new notified that we can submit. The caller retains
-            // ownership of the ref-count they passed in.
-            next.set_notified();
-            next.ref_inc();
-            self.store(next);
-
-            TransitionToNotifiedByVal::Submit
-        }
-    }
-
-    /// Transitions the state to `NOTIFIED`.
-    pub(super) fn transition_to_notified_by_ref(&self) -> TransitionToNotifiedByRef {
+    /// Marks the task notified, returning `true` if the caller should queue a
+    /// `Runnable` for it. A reference for that `Runnable` has then been added.
+    pub(super) fn transition_to_notified(&self) -> bool {
         let mut next = self.load();
 
         if next.is_complete() || next.is_notified() {
-            // The complete state is final, and if the task is already notified
-            // there is nothing to do.
-            TransitionToNotifiedByRef::DoNothing
-        } else if next.is_running() {
-            // If the task is running, we mark it as notified, but we should not
-            // submit as the poll currently in progress is responsible for that.
-            next.set_notified();
-            self.store(next);
-
-            TransitionToNotifiedByRef::DoNothing
-        } else {
-            // The task is idle and not notified. We should submit a
-            // notification.
-            next.set_notified();
-            next.ref_inc();
-            self.store(next);
-
-            TransitionToNotifiedByRef::Submit
-        }
-    }
-
-    /// Sets the cancelled bit and transitions the state to `NOTIFIED` if idle.
-    ///
-    /// Returns `true` if the task needs to be submitted to the run queue for
-    /// execution.
-    pub(super) fn transition_to_notified_and_cancel(&self) -> bool {
-        let mut next = self.load();
-
-        if next.is_cancelled() || next.is_complete() {
-            // Aborts to completed or cancelled tasks are no-ops.
-            false
-        } else if next.is_running() {
-            // If the task is running, we mark it as cancelled. The poll in
-            // progress will notice the cancelled bit when it stops polling and
-            // will kill the task.
-            //
-            // The set_notified() call is not strictly necessary but it will in
-            // some cases let a `wake_by_ref` call return early.
-            next.set_notified();
-            next.set_cancelled();
-            self.store(next);
-
-            false
-        } else {
-            // The task is idle. We set the cancelled and notified bits and
-            // submit a notification if the notified bit was not already set.
-            next.set_cancelled();
-
-            if next.is_notified() {
-                self.store(next);
-                false
-            } else {
-                next.set_notified();
-                next.ref_inc();
-                self.store(next);
-                true
-            }
-        }
-    }
-
-    /// Sets the `CANCELLED` bit and attempts to transition to `Running`.
-    ///
-    /// Returns `true` if the transition to `Running` succeeded.
-    pub(super) fn transition_to_shutdown(&self) -> bool {
-        let prev = self.load();
-        let mut next = prev;
-
-        if next.is_idle() {
-            next.set_running();
+            return false;
         }
 
-        // If the task was not idle, the poll in progress will notice the
-        // cancelled bit and cancel the task once the poll completes.
-        next.set_cancelled();
+        next.set_notified();
+
+        if next.is_running() {
+            // The poll in progress will queue the task when it finishes.
+            self.store(next);
+            return false;
+        }
+
+        next.ref_inc();
         self.store(next);
 
-        prev.is_idle()
+        true
     }
 
-    /// Optimistically tries to swap the state assuming the join handle is
-    /// __immediately__ dropped on spawn.
-    pub(super) fn drop_join_handle_fast(&self) -> Result<(), ()> {
-        if self.val.get() == INITIAL_STATE {
-            self.val.set((INITIAL_STATE - REF_ONE) & !JOIN_INTEREST);
-            Ok(())
-        } else {
-            Err(())
+    /// Requests that the task be cancelled. The task itself acts on this the
+    /// next time it takes or releases the poll lock.
+    pub(super) fn set_cancelled(&self) {
+        let mut next = self.load();
+        next.set_cancelled();
+        self.store(next);
+    }
+
+    /// Records that the task has been registered in an `OwnedTasks`.
+    pub(super) fn set_owned(&self) {
+        let mut next = self.load();
+        debug_assert!(!next.is_owned());
+        next.set_owned();
+        self.store(next);
+    }
+
+    /// Records that the task has left its `OwnedTasks`, returning `true` if it
+    /// was in one. A task is removed at most once, so only the call that sees
+    /// `true` may touch the registry slot.
+    pub(super) fn unset_owned(&self) -> bool {
+        let mut next = self.load();
+
+        if !next.is_owned() {
+            return false;
         }
+
+        next.unset_owned();
+        self.store(next);
+
+        true
     }
 
-    /// Unsets the `JOIN_INTEREST` flag.
-    ///
-    /// Returns `true` if the `JoinHandle` is responsible for dropping the
-    /// output of the future, which is the case when the task has already
-    /// completed.
+    /// Unsets `JOIN_INTEREST`, returning `true` if the `JoinHandle` is the one
+    /// that has to drop the task's output, which is the case when the task has
+    /// already stored it.
     pub(super) fn transition_to_join_handle_dropped(&self) -> bool {
         let mut next = self.load();
         debug_assert!(next.is_join_interested());
@@ -358,56 +233,36 @@ impl State {
         next.unset_join_interested();
         self.store(next);
 
-        // If `COMPLETE` is set the task has already stored its output, so the
-        // `JoinHandle` is responsible for dropping it.
         next.is_complete()
     }
 
     #[inline]
     pub(super) fn ref_inc(&self) {
-        let prev = self.val.get();
-
-        // If the reference count overflowed, abort.
-        if prev > isize::MAX as usize {
-            std::process::abort();
-        }
-
-        self.val.set(prev + REF_ONE);
+        let mut next = self.load();
+        next.ref_inc();
+        self.store(next);
     }
 
-    /// Returns `true` if the task should be released.
+    /// Drops a reference, returning `true` if it was the last one.
     #[inline]
     pub(super) fn ref_dec(&self) -> bool {
-        let prev = self.load();
-        debug_assert!(prev.ref_count() >= 1);
-        self.store(Snapshot(prev.0 - REF_ONE));
-        prev.ref_count() == 1
+        let mut next = self.load();
+        next.ref_dec();
+        self.store(next);
+
+        next.ref_count() == 0
     }
 }
 
-// ===== impl Snapshot =====
-
 impl Snapshot {
-    /// Returns `true` if the task is in an idle state.
+    /// Returns `true` if the task is neither being polled nor finished, and so
+    /// can have the poll lock taken.
     pub(super) fn is_idle(self) -> bool {
         self.0 & (RUNNING | COMPLETE) == 0
     }
 
-    /// Returns `true` if the task has been flagged as notified.
-    pub(super) fn is_notified(self) -> bool {
-        self.0 & NOTIFIED == NOTIFIED
-    }
-
-    fn unset_notified(&mut self) {
-        self.0 &= !NOTIFIED;
-    }
-
-    fn set_notified(&mut self) {
-        self.0 |= NOTIFIED;
-    }
-
     pub(super) fn is_running(self) -> bool {
-        self.0 & RUNNING == RUNNING
+        self.0 & RUNNING != 0
     }
 
     fn set_running(&mut self) {
@@ -418,33 +273,65 @@ impl Snapshot {
         self.0 &= !RUNNING;
     }
 
-    pub(super) fn is_cancelled(self) -> bool {
-        self.0 & CANCELLED == CANCELLED
+    /// Returns `true` if the future has finished and its result is stored.
+    pub(super) fn is_complete(self) -> bool {
+        self.0 & COMPLETE != 0
+    }
+
+    fn set_complete(&mut self) {
+        self.0 |= COMPLETE;
+    }
+
+    fn is_notified(self) -> bool {
+        self.0 & NOTIFIED != 0
+    }
+
+    fn set_notified(&mut self) {
+        self.0 |= NOTIFIED;
+    }
+
+    fn unset_notified(&mut self) {
+        self.0 &= !NOTIFIED;
+    }
+
+    fn is_cancelled(self) -> bool {
+        self.0 & CANCELLED != 0
     }
 
     fn set_cancelled(&mut self) {
         self.0 |= CANCELLED;
     }
 
-    /// Returns `true` if the task's future has completed execution.
-    pub(super) fn is_complete(self) -> bool {
-        self.0 & COMPLETE == COMPLETE
-    }
-
     pub(super) fn is_join_interested(self) -> bool {
-        self.0 & JOIN_INTEREST == JOIN_INTEREST
+        self.0 & JOIN_INTEREST != 0
     }
 
     fn unset_join_interested(&mut self) {
         self.0 &= !JOIN_INTEREST;
     }
 
-    pub(super) fn ref_count(self) -> usize {
+    pub(super) fn is_owned(self) -> bool {
+        self.0 & OWNED != 0
+    }
+
+    fn set_owned(&mut self) {
+        self.0 |= OWNED;
+    }
+
+    fn unset_owned(&mut self) {
+        self.0 &= !OWNED;
+    }
+
+    fn ref_count(self) -> usize {
         (self.0 & REF_COUNT_MASK) >> REF_COUNT_SHIFT
     }
 
+    // The reference count occupies all but the low six bits of a `usize`, and
+    // every reference is a live handle of at least a word, so on a 64 bit
+    // target overflow would need more memory than can be addressed. On a 32 bit
+    // target the ceiling is low enough to be worth a real check.
     fn ref_inc(&mut self) {
-        assert!(self.0 <= isize::MAX as usize);
+        debug_assert!(self.ref_count() < REF_COUNT_MASK >> REF_COUNT_SHIFT);
         self.0 += REF_ONE;
     }
 
@@ -468,6 +355,7 @@ impl fmt::Debug for Snapshot {
             .field("is_notified", &self.is_notified())
             .field("is_cancelled", &self.is_cancelled())
             .field("is_join_interested", &self.is_join_interested())
+            .field("is_owned", &self.is_owned())
             .field("ref_count", &self.ref_count())
             .finish()
     }

@@ -1,25 +1,25 @@
-use crate::runtime::task::{AbortHandle, Header, RawTask};
-
 use std::fmt;
 use std::marker::PhantomData;
-use std::panic::{RefUnwindSafe, UnwindSafe};
+use std::panic::{self, AssertUnwindSafe, Location, RefUnwindSafe, UnwindSafe};
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
-/// An owned permission to join on a task (await its termination).
+use crate::runtime::task::raw::TaskIdGuard;
+use crate::runtime::task::{AbortHandle, Header, Id, RawTask};
+
+/// An owned permission to join a task, that is, to await its result.
 ///
-/// A `JoinHandle` *detaches* the associated task when it is dropped, which
-/// means that there is no longer any handle to the task, and no way to `join`
-/// on it.
+/// Dropping a `JoinHandle` *detaches* the task: it keeps running, but there is
+/// no longer any way to join it.
 ///
-/// It is guaranteed that the destructor of the spawned task has finished before
-/// task completion is observed via `JoinHandle` `await`,
-/// [`JoinHandle::is_finished`] or [`AbortHandle::is_finished`].
+/// The destructor of a spawned task is guaranteed to have finished before its
+/// completion is observed through awaiting a `JoinHandle`, through
+/// [`JoinHandle::is_finished`], or through [`AbortHandle::is_finished`].
 ///
 /// # Cancel safety
 ///
 /// Awaiting a `&mut JoinHandle<T>` is cancel safe: if the await is cancelled,
-/// the output of the task is not lost.
+/// the task's result is not lost.
 pub struct JoinHandle<T> {
     raw: RawTask,
     _p: PhantomData<T>,
@@ -27,6 +27,7 @@ pub struct JoinHandle<T> {
 
 impl<T> UnwindSafe for JoinHandle<T> {}
 impl<T> RefUnwindSafe for JoinHandle<T> {}
+impl<T> Unpin for JoinHandle<T> {}
 
 impl<T> JoinHandle<T> {
     pub(super) fn new(raw: RawTask) -> JoinHandle<T> {
@@ -36,97 +37,120 @@ impl<T> JoinHandle<T> {
         }
     }
 
-    /// Aborts the task associated with the handle.
+    /// Aborts the task.
     ///
-    /// Awaiting a cancelled task might complete as usual if the task was
-    /// already completed at the time it was cancelled, but most likely it will
-    /// fail with a [cancelled] `JoinError`.
+    /// Awaiting an aborted task may still yield its result, if it had already
+    /// finished when the abort landed; otherwise it fails with a [cancelled]
+    /// `JoinError`.
     ///
     /// [cancelled]: method@super::JoinError::is_cancelled
     pub fn abort(&self) {
         self.raw.remote_abort();
     }
 
-    /// Checks if the task associated with this `JoinHandle` has finished.
-    ///
-    /// Note that this method can return `false` even if [`abort`] has been
-    /// called on the task, because the cancellation only takes effect once the
-    /// task is polled again.
-    ///
-    /// [`abort`]: method@JoinHandle::abort
-    pub fn is_finished(&self) -> bool {
-        let state = self.raw.state().load();
-        state.is_complete()
-    }
-
-    /// Returns a new [`AbortHandle`] that can be used to abort this task.
+    /// Returns a new [`AbortHandle`] for this task.
     #[must_use = "abort handles do nothing unless `.abort` is called"]
     pub fn abort_handle(&self) -> AbortHandle {
         self.raw.ref_inc();
         AbortHandle::new(self.raw)
     }
 
-    /// Returns a [task ID] that uniquely identifies this task relative to other
-    /// currently spawned tasks.
+    /// Returns whether the task has finished.
     ///
-    /// [task ID]: crate::task::Id
-    pub fn id(&self) -> super::Id {
-        // Safety: The header pointer is valid.
-        unsafe { Header::get_id(self.raw.header_ptr()) }
+    /// This can still be `false` after [`abort`] has been called, since a task
+    /// is only cancelled once the runtime gets back to it.
+    ///
+    /// [`abort`]: method@JoinHandle::abort
+    pub fn is_finished(&self) -> bool {
+        self.raw.state().load().is_complete()
     }
 
-    /// Returns the source code location where this task was spawned.
-    pub fn spawned_at(&self) -> &'static std::panic::Location<'static> {
-        // Safety: The header pointer is valid.
-        unsafe { Header::get_spawn_location(self.raw.header_ptr()) }
+    /// Returns the [`Id`] of the task.
+    pub fn id(&self) -> Id {
+        self.raw.header().id
+    }
+
+    /// Returns the source location the task was spawned from.
+    pub fn spawned_at(&self) -> &'static Location<'static> {
+        self.raw.header().spawned_at
     }
 }
-
-impl<T> Unpin for JoinHandle<T> {}
 
 impl<T> Future for JoinHandle<T> {
     type Output = super::Result<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut ret = Poll::Pending;
-
-        // Try to read the task output. If the task is not yet complete, the
-        // waker is stored and is notified once the task does complete.
-        //
-        // The function must go via the vtable, which requires erasing generic
-        // types. To do this, the function "return" is placed on the stack
-        // **before** calling the function and is passed into the function using
-        // `*mut ()`.
-        //
-        // Safety:
-        //
-        // The type of `T` must match the task's output type.
-        unsafe {
-            self.raw.try_read_output(&mut ret, cx.waker());
+        if !can_read_output(self.raw.header(), cx.waker()) {
+            return Poll::Pending;
         }
 
-        ret
+        // The result is moved out through a pointer, since taking it needs the
+        // task's future type, which only its vtable still knows.
+        let mut output = Poll::Pending;
+
+        // Safety: `T` is the task's output type, and the check above says the
+        // task is complete.
+        unsafe { self.raw.take_output(&mut output) };
+
+        assert!(
+            output.is_ready(),
+            "`JoinHandle` polled after its result was taken"
+        );
+
+        output
     }
 }
 
 impl<T> Drop for JoinHandle<T> {
     fn drop(&mut self) {
-        if self.raw.state().drop_join_handle_fast().is_ok() {
-            return;
+        if self.raw.state().transition_to_join_handle_dropped() {
+            // The task finished, and nobody is left to read its result, so it
+            // is dropped here where its type is known. There may be nothing
+            // left to take, if the handle was awaited before being dropped.
+            let mut output: Poll<super::Result<T>> = Poll::Pending;
+            let _guard = TaskIdGuard::enter(self.raw.header().id);
+
+            // Safety: `T` is the task's output type, and `COMPLETE` is set.
+            unsafe { self.raw.take_output(&mut output) };
+
+            // Dropping the handle is how a caller says it is not interested in
+            // what the task produced, so a panicking result is dropped quietly.
+            let _ = panic::catch_unwind(AssertUnwindSafe(move || drop(output)));
         }
 
-        self.raw.drop_join_handle_slow();
+        // Safety: `JOIN_INTEREST` is now unset, so the runtime will not read
+        // the waker, and this handle was its only other accessor.
+        unsafe { self.raw.header().set_waker(None) };
+
+        self.raw.drop_reference();
     }
 }
 
-impl<T> fmt::Debug for JoinHandle<T>
-where
-    T: fmt::Debug,
-{
+impl<T> fmt::Debug for JoinHandle<T> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Safety: The header pointer is valid.
-        let id_ptr = unsafe { Header::get_id_ptr(self.raw.header_ptr()) };
-        let id = unsafe { id_ptr.as_ref() };
-        fmt.debug_struct("JoinHandle").field("id", id).finish()
+        fmt.debug_struct("JoinHandle")
+            .field("id", &self.id())
+            .finish()
     }
+}
+
+/// Returns `true` if the task's result is ready to be taken, storing `waker` to
+/// be notified when it is otherwise.
+fn can_read_output(header: &Header, waker: &Waker) -> bool {
+    let snapshot = header.state.load();
+    debug_assert!(snapshot.is_join_interested());
+
+    if snapshot.is_complete() {
+        return true;
+    }
+
+    // Safety: `JOIN_INTEREST` is set, so the `JoinHandle` this call comes from
+    // owns the field.
+    unsafe {
+        if !header.will_wake(waker) {
+            header.set_waker(Some(waker.clone()));
+        }
+    }
+
+    false
 }
