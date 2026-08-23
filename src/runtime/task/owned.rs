@@ -16,6 +16,7 @@
 //! The collection can be closed to prevent adding new tasks during shutdown of
 //! the scheduler that owns it.
 
+use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::mem;
 
@@ -23,7 +24,6 @@ use slab::Slab;
 
 use crate::runtime::task::core::{Header, Trailer};
 use crate::runtime::task::{JoinHandle, Runnable, Schedule, SpawnLocation, Task};
-use crate::util::UnsafeCell;
 
 /// The key stored in a task that is not in any `OwnedTasks`.
 ///
@@ -161,7 +161,7 @@ impl<S: 'static> OwnedTasks<S> {
         // Safety: This type is not Sync, so concurrent calls of this method
         // can't happen. Furthermore, all uses of this method in this file make
         // sure that they don't call `with_inner` recursively.
-        self.inner.with_mut(|ptr| unsafe { f(&mut *ptr) })
+        f(unsafe { &mut *self.inner.get() })
     }
 
     pub(crate) fn is_closed(&self) -> bool {

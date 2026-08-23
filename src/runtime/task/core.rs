@@ -23,7 +23,6 @@ use super::owned::NOT_OWNED;
 use super::raw::{self, Vtable};
 use super::state::State;
 use crate::runtime::context;
-use crate::util::UnsafeCell;
 
 /// The task cell. Contains the components of the task.
 ///
@@ -45,7 +44,7 @@ pub(super) struct Cell<T: Future, S> {
 }
 
 pub(super) struct CoreStage<T: Future> {
-    stage: UnsafeCell<Stage<T>>,
+    stage: cell::UnsafeCell<Stage<T>>,
 }
 
 /// The core of the task.
@@ -92,7 +91,7 @@ pub(super) struct Trailer {
     pub(super) owned: cell::Cell<usize>,
 
     /// Consumer task waiting on completion of this task.
-    pub(super) waker: UnsafeCell<Option<Waker>>,
+    pub(super) waker: cell::UnsafeCell<Option<Waker>>,
 }
 
 /// Either the future or the output.
@@ -125,7 +124,7 @@ impl<T: Future, S: Schedule> Cell<T, S> {
             core: Core {
                 scheduler,
                 stage: CoreStage {
-                    stage: UnsafeCell::new(Stage::Running(future)),
+                    stage: cell::UnsafeCell::new(Stage::Running(future)),
                 },
                 task_id,
                 spawned_at,
@@ -210,19 +209,17 @@ impl<T: Future, S: Schedule> Core<T, S> {
     /// heap.
     pub(super) fn poll(&self, mut cx: Context<'_>) -> Poll<T::Output> {
         let res = {
-            self.stage.stage.with_mut(|ptr| {
-                // Safety: The caller ensures mutual exclusion to the field.
-                let future = match unsafe { &mut *ptr } {
-                    Stage::Running(future) => future,
-                    _ => unreachable!("unexpected stage"),
-                };
+            // Safety: The caller ensures mutual exclusion to the field.
+            let future = match unsafe { &mut *self.stage.stage.get() } {
+                Stage::Running(future) => future,
+                _ => unreachable!("unexpected stage"),
+            };
 
-                // Safety: The caller ensures the future is pinned.
-                let future = unsafe { Pin::new_unchecked(future) };
+            // Safety: The caller ensures the future is pinned.
+            let future = unsafe { Pin::new_unchecked(future) };
 
-                let _guard = TaskIdGuard::enter(self.task_id);
-                future.poll(&mut cx)
-            })
+            let _guard = TaskIdGuard::enter(self.task_id);
+            future.poll(&mut cx)
         };
 
         if res.is_ready() {
@@ -264,18 +261,17 @@ impl<T: Future, S: Schedule> Core<T, S> {
     pub(super) fn take_output(&self) -> super::Result<T::Output> {
         use std::mem;
 
-        self.stage.stage.with_mut(|ptr| {
-            // Safety: the caller ensures mutual exclusion to the field.
-            match mem::replace(unsafe { &mut *ptr }, Stage::Consumed) {
-                Stage::Finished(output) => output,
-                _ => panic!("JoinHandle polled after completion"),
-            }
-        })
+        // Safety: the caller ensures mutual exclusion to the field.
+        match mem::replace(unsafe { &mut *self.stage.stage.get() }, Stage::Consumed) {
+            Stage::Finished(output) => output,
+            _ => panic!("JoinHandle polled after completion"),
+        }
     }
 
     unsafe fn set_stage(&self, stage: Stage<T>) {
         let _guard = TaskIdGuard::enter(self.task_id);
-        self.stage.stage.with_mut(|ptr| *ptr = stage);
+        // Safety: the caller ensures mutual exclusion to the field.
+        *self.stage.stage.get() = stage;
     }
 }
 
@@ -359,7 +355,7 @@ impl Header {
 impl Trailer {
     fn new() -> Self {
         Trailer {
-            waker: UnsafeCell::new(None),
+            waker: cell::UnsafeCell::new(None),
             owned: cell::Cell::new(NOT_OWNED),
         }
     }
@@ -370,9 +366,7 @@ impl Trailer {
     /// single threaded, so the caller must simply be the `JoinHandle` (or the
     /// runtime once `JOIN_INTEREST` has been unset).
     pub(super) unsafe fn set_waker(&self, waker: Option<Waker>) {
-        self.waker.with_mut(|ptr| {
-            *ptr = waker;
-        });
+        *self.waker.get() = waker;
     }
 
     /// Returns `true` if a waker is stored and it wakes the same task as
@@ -382,10 +376,10 @@ impl Trailer {
     ///
     /// See [`Trailer::set_waker`].
     pub(super) unsafe fn will_wake(&self, waker: &Waker) -> bool {
-        self.waker.with(|ptr| match &*ptr {
+        match &*self.waker.get() {
             Some(stored) => stored.will_wake(waker),
             None => false,
-        })
+        }
     }
 
     /// Wakes the join waker, if one has been stored.
@@ -394,13 +388,11 @@ impl Trailer {
     /// that would tell us whether one is present does not exist in a single
     /// threaded runtime, so we simply check the `Option`.
     pub(super) fn wake_join(&self) {
-        self.waker.with(|ptr| {
-            // Safety: the runtime only reads the waker once the task is
-            // complete, at which point the `JoinHandle` will not write to it.
-            if let Some(waker) = unsafe { &*ptr } {
-                waker.wake_by_ref();
-            }
-        });
+        // Safety: the runtime only reads the waker once the task is complete,
+        // at which point the `JoinHandle` will not write to it.
+        if let Some(waker) = unsafe { &*self.waker.get() } {
+            waker.wake_by_ref();
+        }
     }
 }
 
