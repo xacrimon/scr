@@ -5,6 +5,7 @@
 //! through the three entries of [`Vtable`], each of which casts the pointer
 //! back to a [`Cell<T>`].
 
+use std::any::Any;
 #[cfg(not(debug_assertions))]
 use std::hint;
 use std::mem;
@@ -423,7 +424,11 @@ unsafe fn poll_future<T: Future>(ptr: NonNull<Header>, mut cx: Context<'_>) -> P
             // panic as well, but there is already a panic to report, so that
             // one is dropped.
             // Safety: the poll lock is still held.
-            let _ = panic::catch_unwind(AssertUnwindSafe(|| unsafe { drop_stage::<T>(ptr) }));
+            if let Err(panic) =
+                panic::catch_unwind(AssertUnwindSafe(|| unsafe { drop_stage::<T>(ptr) }))
+            {
+                drop_panic(panic);
+            }
 
             Err(JoinError::panic(id_of(ptr), panic))
         }
@@ -466,7 +471,7 @@ unsafe fn complete<T: Future>(ptr: NonNull<Header>) {
     let snapshot = raw.state().transition_to_complete();
 
     // Waking the joiner and dropping an unwanted result both reach user code.
-    let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+    let caught = panic::catch_unwind(AssertUnwindSafe(|| {
         if snapshot.is_join_interested() {
             // The `JoinHandle` takes the result from here.
             raw.header().wake_join();
@@ -478,9 +483,19 @@ unsafe fn complete<T: Future>(ptr: NonNull<Header>) {
         }
     }));
 
+    if let Err(panic) = caught {
+        drop_panic(panic);
+    }
+
     if raw.state().transition_to_terminal(release(ptr)) {
         raw.dealloc();
     }
+}
+
+#[cold]
+#[inline(never)]
+fn drop_panic(panic: Box<dyn Any + Send>) {
+    drop(panic);
 }
 
 /// Takes the task out of the runtime's registry, returning how many references
