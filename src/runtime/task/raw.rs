@@ -8,6 +8,7 @@
 use std::any::Any;
 #[cfg(not(debug_assertions))]
 use std::hint;
+use std::marker::PhantomData;
 use std::mem;
 use std::panic::{self, AssertUnwindSafe, Location};
 use std::pin::Pin;
@@ -309,29 +310,52 @@ unsafe fn stage_of<'a, T: Future>(ptr: NonNull<Header>) -> &'a cell::UnsafeCell<
     unsafe { &ptr.cast::<Cell<T>>().as_ref().stage }
 }
 
-/// Puts `stage` in the task's slot and returns what was there.
+/// Fills a slot that is known to be empty.
 ///
-/// The new value is written before the old one is dropped, so a destructor
-/// that panics cannot leave a dropped value behind for the next caller to drop
-/// a second time.
+/// Nothing is handed back, so no drop glue for an old value is generated and
+/// the future is never copied out. `Stage::Consumed` has no destructor, so
+/// overwriting one loses nothing.
 ///
 /// # Safety
 ///
-/// The caller must hold the poll lock, or be the `JoinHandle` of a task that
-/// has completed. `T` must be the task's future type.
-unsafe fn replace_stage<T: Future>(ptr: NonNull<Header>, stage: Stage<T>) -> Stage<T> {
+/// The caller must own the slot, `T` must be the task's future type, and the
+/// slot must hold [`Stage::Consumed`].
+unsafe fn write_stage<T: Future>(ptr: NonNull<Header>, stage: Stage<T>) {
     // Safety: the caller guarantees exclusive access to the slot.
-    unsafe { mem::replace(&mut *stage_of::<T>(ptr).get(), stage) }
+    let slot = unsafe { stage_of::<T>(ptr) }.get();
+    debug_assert!(matches!(unsafe { &*slot }, Stage::Consumed));
+
+    // Safety: the slot holds a `Consumed`, which needs no dropping.
+    unsafe { slot.write(stage) };
 }
 
 /// Drops whatever the task's slot holds, leaving it empty.
 ///
+/// The value is dropped where it lies rather than moved out first, so a large
+/// future costs nothing to throw away. `MarkConsumed` empties the slot however
+/// that turns out, so a destructor that panics still cannot leave a dropped
+/// value behind for the next caller to drop a second time. Until it runs the
+/// slot names a half dropped future, which is safe only because the poll lock
+/// is held for the whole of this and nothing reads the slot without it.
+///
 /// # Safety
 ///
-/// See [`replace_stage`].
+/// The caller must hold the poll lock, and `T` must be the task's future type.
 unsafe fn drop_stage<T: Future>(ptr: NonNull<Header>) {
+    struct MarkConsumed<T: Future>(NonNull<Header>, PhantomData<fn() -> T>);
+
+    impl<T: Future> Drop for MarkConsumed<T> {
+        fn drop(&mut self) {
+            // Safety: whoever built this holds the slot, and its contents have
+            // just been dropped, so nothing is overwritten that still matters.
+            unsafe { stage_of::<T>(self.0).get().write(Stage::Consumed) };
+        }
+    }
+
+    let _mark = MarkConsumed::<T>(ptr, PhantomData);
+
     // Safety: the caller guarantees exclusive access to the slot.
-    drop(unsafe { replace_stage::<T>(ptr, Stage::Consumed) });
+    unsafe { stage_of::<T>(ptr).get().drop_in_place() };
 }
 
 fn id_of(ptr: NonNull<Header>) -> Id {
@@ -435,7 +459,7 @@ unsafe fn poll_future<T: Future>(ptr: NonNull<Header>, mut cx: Context<'_>) -> P
     };
 
     // Safety: the slot was emptied above, on either path that reaches here.
-    unsafe { replace_stage::<T>(ptr, Stage::Finished(output)) };
+    unsafe { write_stage::<T>(ptr, Stage::Finished(output)) };
 
     Poll::Ready(())
 }
@@ -456,7 +480,7 @@ unsafe fn cancel<T: Future>(ptr: NonNull<Header>) {
     };
 
     // Safety: the slot was emptied just above.
-    unsafe { replace_stage::<T>(ptr, Stage::Finished(Err(error))) };
+    unsafe { write_stage::<T>(ptr, Stage::Finished(Err(error))) };
 }
 
 /// Finishes a task whose result is already stored, releasing the reference the
@@ -530,9 +554,18 @@ unsafe fn take_output<T: Future>(ptr: NonNull<Header>, dst: *mut ()) {
     let dst = unsafe { &mut *dst.cast::<Poll<super::Result<T::Output>>>() };
 
     // Safety: the task is complete, so the `JoinHandle` owns the slot.
-    if let Stage::Finished(output) = unsafe { replace_stage::<T>(ptr, Stage::Consumed) } {
-        *dst = Poll::Ready(output);
-    }
+    let slot = unsafe { stage_of::<T>(ptr) }.get();
+
+    // Only the result is moved out, never the whole slot.
+    let output = match unsafe { &mut *slot } {
+        Stage::Finished(output) => unsafe { std::ptr::read(output) },
+        _ => return,
+    };
+
+    // Safety: what was in the slot has just been moved out of it.
+    unsafe { slot.write(Stage::Consumed) };
+
+    *dst = Poll::Ready(output);
 }
 
 /// # Safety
