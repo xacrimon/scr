@@ -70,11 +70,23 @@ pub(super) enum TransitionToRunning {
 pub(super) enum TransitionToIdle {
     /// Nothing happened during the poll. Drop the reference.
     Idle,
-    /// The task was woken while it was being polled. A reference for a fresh
-    /// `Runnable` has been added; queue it and then drop the caller's own.
+    /// The task was woken while it was being polled. No reference was
+    /// minted for this: the one the poll was holding becomes the new
+    /// `Runnable`'s, so queue it and stop, without a matching drop.
     Notified,
     /// The task was cancelled while it was being polled. Kill it.
     Cancelled,
+}
+
+/// What happens to the caller's own reference when notifying a task.
+pub(super) enum CallerRef {
+    /// The caller keeps using its reference afterward, so a notification
+    /// that finds the task idle must mint a new one for the `Runnable`.
+    Kept,
+    /// The caller is giving up its reference as part of this call. A
+    /// notification that finds the task idle mints nothing: that very
+    /// reference becomes the `Runnable`'s.
+    Consumed,
 }
 
 impl State {
@@ -120,6 +132,12 @@ impl State {
     }
 
     /// Releases the poll lock after the future returned `Pending`.
+    ///
+    /// A wake that lands while the task is running mints no reference of its
+    /// own: the poll lock's own reference simply becomes the next
+    /// `Runnable`'s, since nothing else needs it once the poll returns. That
+    /// is what [`TransitionToIdle::Notified`] hands back — a signal to
+    /// requeue with the same reference, not a fresh one to drop afterward.
     pub(super) fn transition_to_idle(&self) -> TransitionToIdle {
         let mut next = self.load();
         debug_assert!(next.is_running());
@@ -129,13 +147,11 @@ impl State {
         }
 
         next.unset_running();
+        self.store(next);
 
         if next.is_notified() {
-            next.ref_inc();
-            self.store(next);
             TransitionToIdle::Notified
         } else {
-            self.store(next);
             TransitionToIdle::Idle
         }
     }
@@ -169,8 +185,13 @@ impl State {
     }
 
     /// Marks the task notified, returning `true` if the caller should queue a
-    /// `Runnable` for it. A reference for that `Runnable` has then been added.
-    pub(super) fn transition_to_notified(&self) -> bool {
+    /// `Runnable` for it.
+    ///
+    /// If that is idle-triggered, `caller_ref` decides where its reference
+    /// comes from: a fresh one is minted unless the caller is [handing over
+    /// its own](CallerRef::Consumed), in which case nothing is minted and
+    /// that reference is what the caller must schedule.
+    pub(super) fn transition_to_notified(&self, caller_ref: CallerRef) -> bool {
         let mut next = self.load();
 
         if next.is_complete() || next.is_notified() {
@@ -178,17 +199,14 @@ impl State {
         }
 
         next.set_notified();
+        let was_idle = !next.is_running();
 
-        if next.is_running() {
-            // The poll in progress will queue the task when it finishes.
-            self.store(next);
-            return false;
+        if was_idle && matches!(caller_ref, CallerRef::Kept) {
+            next.ref_inc();
         }
 
-        next.ref_inc();
         self.store(next);
-
-        true
+        was_idle
     }
 
     /// Requests that the task be cancelled. The task itself acts on this the

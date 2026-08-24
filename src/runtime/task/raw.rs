@@ -5,6 +5,8 @@
 //! through the three entries of [`Vtable`], each of which casts the pointer
 //! back to a [`Cell<T>`].
 
+#[cfg(not(debug_assertions))]
+use std::hint;
 use std::mem;
 use std::panic::{self, AssertUnwindSafe, Location};
 use std::pin::Pin;
@@ -13,7 +15,7 @@ use std::task::{Context, Poll, Waker};
 use std::{cell, fmt};
 
 use crate::runtime::context;
-use crate::runtime::task::state::{State, TransitionToIdle, TransitionToRunning};
+use crate::runtime::task::state::{CallerRef, State, TransitionToIdle, TransitionToRunning};
 use crate::runtime::task::waker::waker_ref;
 use crate::runtime::task::{Id, JoinError, Runnable, Task};
 
@@ -181,33 +183,36 @@ impl RawTask {
         }
     }
 
-    /// Hands a `Runnable` to the run queue, consuming the reference the
-    /// notifying transition minted for it.
+    /// Hands a `Runnable` to the run queue, consuming a reference that the
+    /// caller guarantees is available for it — either one a transition just
+    /// minted, or the caller's own that it is choosing to give up.
     fn schedule(self) {
-        // Safety: the transition that led here added a reference for exactly
-        // this `Runnable`.
+        // Safety: the caller guarantees a reference is available to transfer.
         let runnable = Runnable(unsafe { Task::from_raw(self.ptr) });
 
         context::with_handle(|handle| handle.schedule(runnable));
     }
 
     /// Marks the task notified, queueing it if that is now this caller's job.
-    /// No reference is consumed, so the caller must hold one.
+    /// No reference is consumed, so the caller must hold one throughout.
     fn notify(self) {
-        if self.state().transition_to_notified() {
+        if self.state().transition_to_notified(CallerRef::Kept) {
             self.schedule();
         }
     }
 
     /// Wakes the task, consuming a reference.
+    ///
+    /// If the task is idle, that very reference becomes the new `Runnable`'s
+    /// — nothing is minted and nothing is dropped, since nothing else needs
+    /// to change. Otherwise there is no `Runnable` to hand it to, so it is
+    /// simply dropped.
     pub(super) fn wake_by_val(self) {
-        // The reference is released only once `notify` has returned, so the
-        // task survives even if the run queue drops the `Runnable` it is
-        // handed. A guard does the releasing so that a `notify` that panics -
-        // which waking from outside a runtime does - does not leak the task.
-        let _release = ReleaseOnDrop(self);
-
-        self.notify();
+        if self.state().transition_to_notified(CallerRef::Consumed) {
+            self.schedule();
+        } else {
+            self.drop_reference();
+        }
     }
 
     /// Wakes the task. The caller keeps its reference.
@@ -223,15 +228,6 @@ impl RawTask {
     pub(super) fn remote_abort(self) {
         self.state().set_cancelled();
         self.notify();
-    }
-}
-
-/// Releases one reference to a task when dropped.
-struct ReleaseOnDrop(RawTask);
-
-impl Drop for ReleaseOnDrop {
-    fn drop(&mut self) {
-        self.0.drop_reference();
     }
 }
 
@@ -371,13 +367,7 @@ unsafe fn poll<T: Future>(ptr: NonNull<Header>) {
 
             match raw.state().transition_to_idle() {
                 TransitionToIdle::Idle => raw.drop_reference(),
-                TransitionToIdle::Notified => {
-                    // The transition minted the reference for the new
-                    // `Runnable`. Ours is released only afterwards, so the task
-                    // survives even if the queue drops what it is handed.
-                    raw.schedule();
-                    raw.drop_reference();
-                }
+                TransitionToIdle::Notified => raw.schedule(),
                 // Safety: the poll lock is held and the future type matches.
                 TransitionToIdle::Cancelled => unsafe {
                     cancel::<T>(ptr);
@@ -406,7 +396,10 @@ unsafe fn poll_future<T: Future>(ptr: NonNull<Header>, mut cx: Context<'_>) -> P
         // task is heap allocated and never moved.
         let output = unsafe {
             let Stage::Running(future) = &mut *stage_of::<T>(ptr).get() else {
-                unreachable!("polled a task that holds no future")
+                #[cfg(debug_assertions)]
+                unreachable!("polled a task that holds no future");
+                #[cfg(not(debug_assertions))]
+                hint::unreachable_unchecked();
             };
 
             Pin::new_unchecked(future).poll(&mut cx)
