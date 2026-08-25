@@ -2,7 +2,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::panic::{self, AssertUnwindSafe, Location, RefUnwindSafe, UnwindSafe};
 use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, LocalWaker, Poll};
 
 use crate::runtime::task::raw::TaskIdGuard;
 use crate::runtime::task::{AbortHandle, Header, Id, RawTask};
@@ -80,7 +80,7 @@ impl<T> Future for JoinHandle<T> {
     type Output = super::Result<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if !can_read_output(self.raw.header(), cx.waker()) {
+        if !can_read_output(self.raw.header(), cx.local_waker()) {
             return Poll::Pending;
         }
 
@@ -136,7 +136,7 @@ impl<T> fmt::Debug for JoinHandle<T> {
 
 /// Returns `true` if the task's result is ready to be taken, storing `waker` to
 /// be notified when it is otherwise.
-fn can_read_output(header: &Header, waker: &Waker) -> bool {
+fn can_read_output(header: &Header, waker: &LocalWaker) -> bool {
     let snapshot = header.state.load();
     debug_assert!(snapshot.is_join_interested());
 

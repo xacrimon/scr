@@ -1,3 +1,5 @@
+#![feature(local_waker)]
+
 //! Not a real example; exists only so codegen can be inspected against a future
 //! whose *type* is large, to see how much of the task machinery scales with it.
 
@@ -23,7 +25,7 @@ impl Future for BigFuture {
         } else {
             self.polled = true;
             self.data[0] = self.data[254].wrapping_add(1);
-            cx.waker().wake_by_ref();
+            cx.local_waker().wake_by_ref();
             Poll::Pending
         }
     }
@@ -45,7 +47,7 @@ impl Future for BigDropFuture {
         } else {
             self.polled = true;
             self.data[0] = Some(Box::new(1));
-            cx.waker().wake_by_ref();
+            cx.local_waker().wake_by_ref();
             Poll::Pending
         }
     }

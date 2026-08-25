@@ -6,7 +6,7 @@
 
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
-use std::task::{RawWaker, RawWakerVTable, Waker};
+use std::task::{LocalWaker, RawWaker, RawWakerVTable, Waker};
 
 use crate::runtime::task::{Header, RawTask};
 
@@ -29,11 +29,9 @@ pub(super) unsafe fn waker_ref(ptr: NonNull<Header>) -> ManuallyDrop<Waker> {
     ManuallyDrop::new(unsafe { Waker::from_raw(raw_waker(ptr)) })
 }
 
-fn raw_waker(ptr: NonNull<Header>) -> RawWaker {
-    RawWaker::new(ptr.as_ptr().cast_const().cast(), &VTABLE)
+pub(super) unsafe fn waker_ref_local(ptr: NonNull<Header>) -> ManuallyDrop<LocalWaker> {
+    ManuallyDrop::new(unsafe { LocalWaker::from_raw(raw_waker_local(ptr)) })
 }
-
-static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_waker);
 
 /// # Safety
 ///
@@ -44,24 +42,52 @@ unsafe fn task_of(ptr: *const ()) -> RawTask {
     unsafe { RawTask::from_raw(NonNull::new_unchecked(ptr.cast_mut().cast())) }
 }
 
-unsafe fn clone(ptr: *const ()) -> RawWaker {
+fn raw_waker(ptr: NonNull<Header>) -> RawWaker {
+    RawWaker::new(ptr.as_ptr().cast_const().cast(), &VTABLE)
+}
+
+fn raw_waker_local(ptr: NonNull<Header>) -> RawWaker {
+    RawWaker::new(ptr.as_ptr().cast_const().cast(), &VTABLE_LOCAL)
+}
+
+static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_waker);
+
+unsafe fn clone(_ptr: *const ()) -> RawWaker {
+    panic!("clone");
+}
+
+unsafe fn wake(_ptr: *const ()) {
+   panic!("wake");
+}
+
+unsafe fn wake_by_ref(_ptr: *const ()) {
+    panic!("wake_by_ref");
+}
+
+unsafe fn drop_waker(_ptr: *const ()) {
+    panic!("drop_waker");
+}
+
+static VTABLE_LOCAL: RawWakerVTable = RawWakerVTable::new(clone_local, wake_local, wake_by_ref_local, drop_waker_local);
+
+unsafe fn clone_local(ptr: *const ()) -> RawWaker {
     // Safety: see `task_of`.
     let task = unsafe { task_of(ptr) };
     task.ref_inc();
     raw_waker(task.header_ptr())
 }
 
-unsafe fn wake(ptr: *const ()) {
+unsafe fn wake_local(ptr: *const ()) {
     // Safety: see `task_of`; this waker's reference is consumed.
     unsafe { task_of(ptr) }.wake_by_val();
 }
 
-unsafe fn wake_by_ref(ptr: *const ()) {
+unsafe fn wake_by_ref_local(ptr: *const ()) {
     // Safety: see `task_of`.
     unsafe { task_of(ptr) }.wake_by_ref();
 }
 
-unsafe fn drop_waker(ptr: *const ()) {
+unsafe fn drop_waker_local(ptr: *const ()) {
     // Safety: see `task_of`; this waker's reference is released.
     unsafe { task_of(ptr) }.drop_reference();
 }

@@ -1,3 +1,5 @@
+#![feature(local_waker)]
+
 use std::cell::Cell;
 use std::future::{self, Future};
 use std::pin::Pin;
@@ -269,7 +271,7 @@ fn waking_a_parked_task_reschedules_it() {
     /// Returns `Pending` on the first poll, storing its waker; the waker is
     /// invoked by the test to reschedule the task.
     struct WakeMeOnce {
-        waker: Rc<Cell<Option<std::task::Waker>>>,
+        waker: Rc<Cell<Option<std::task::LocalWaker>>>,
         polled: bool,
     }
 
@@ -282,13 +284,13 @@ fn waking_a_parked_task_reschedules_it() {
             }
 
             self.polled = true;
-            self.waker.set(Some(cx.waker().clone()));
+            self.waker.set(Some(cx.local_waker().clone()));
             Poll::Pending
         }
     }
 
     let out = rt.block_on(async {
-        let waker: Rc<Cell<Option<std::task::Waker>>> = Rc::new(Cell::new(None));
+        let waker: Rc<Cell<Option<std::task::LocalWaker>>> = Rc::new(Cell::new(None));
         let handle = task::spawn(WakeMeOnce {
             waker: Rc::clone(&waker),
             polled: false,
@@ -401,7 +403,7 @@ fn repeated_wakes_queue_the_task_once() {
 
     struct CountPolls {
         polls: Rc<Cell<u32>>,
-        waker: Rc<Cell<Option<std::task::Waker>>>,
+        waker: Rc<Cell<Option<std::task::LocalWaker>>>,
     }
 
     impl Future for CountPolls {
@@ -414,7 +416,7 @@ fn repeated_wakes_queue_the_task_once() {
                 return Poll::Ready(self.polls.get());
             }
 
-            self.waker.set(Some(cx.waker().clone()));
+            self.waker.set(Some(cx.local_waker().clone()));
             Poll::Pending
         }
     }
@@ -422,7 +424,7 @@ fn repeated_wakes_queue_the_task_once() {
     let total = rt.block_on({
         let polls = Rc::clone(&polls);
         async move {
-            let waker: Rc<Cell<Option<std::task::Waker>>> = Rc::new(Cell::new(None));
+            let waker: Rc<Cell<Option<std::task::LocalWaker>>> = Rc::new(Cell::new(None));
             let handle = task::spawn(CountPolls {
                 polls: Rc::clone(&polls),
                 waker: Rc::clone(&waker),
@@ -466,7 +468,7 @@ fn self_wake_by_value_during_poll() {
             // `wake`, not `wake_by_ref`: this consumes a ref-count while the
             // task is RUNNING, which is the path under test here.
             #[allow(clippy::waker_clone_wake)]
-            cx.waker().clone().wake();
+            cx.local_waker().clone().wake();
 
             Poll::Pending
         }
@@ -552,7 +554,7 @@ fn shutdown_kills_a_task_that_is_still_queued() {
 /// the run queue, which the shutdown loop then drains.
 #[test]
 fn a_destructor_may_wake_another_task_during_shutdown() {
-    struct WakeOnDrop(Rc<Cell<Option<std::task::Waker>>>);
+    struct WakeOnDrop(Rc<Cell<Option<std::task::LocalWaker>>>);
     impl Drop for WakeOnDrop {
         fn drop(&mut self) {
             if let Some(waker) = self.0.take() {
@@ -563,20 +565,20 @@ fn a_destructor_may_wake_another_task_during_shutdown() {
 
     /// Parks on the first poll, leaving its waker in `slot`.
     struct ParkAndShare {
-        slot: Rc<Cell<Option<std::task::Waker>>>,
+        slot: Rc<Cell<Option<std::task::LocalWaker>>>,
     }
 
     impl Future for ParkAndShare {
         type Output = ();
 
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            self.slot.set(Some(cx.waker().clone()));
+            self.slot.set(Some(cx.local_waker().clone()));
             Poll::Pending
         }
     }
 
     let rt = Runtime::new();
-    let slot: Rc<Cell<Option<std::task::Waker>>> = Rc::new(Cell::new(None));
+    let slot: Rc<Cell<Option<std::task::LocalWaker>>> = Rc::new(Cell::new(None));
     let woke = Rc::new(Cell::new(false));
 
     // The waker is spawned first so that it is shut down first, while the task
@@ -647,20 +649,20 @@ fn two_runtimes_on_one_thread_are_independent() {
 #[should_panic(expected = "outside of a runtime")]
 fn waking_a_task_outside_of_a_runtime_panics() {
     struct ParkAndShare {
-        slot: Rc<Cell<Option<std::task::Waker>>>,
+        slot: Rc<Cell<Option<std::task::LocalWaker>>>,
     }
 
     impl Future for ParkAndShare {
         type Output = ();
 
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            self.slot.set(Some(cx.waker().clone()));
+            self.slot.set(Some(cx.local_waker().clone()));
             Poll::Pending
         }
     }
 
     let rt = Runtime::new();
-    let slot: Rc<Cell<Option<std::task::Waker>>> = Rc::new(Cell::new(None));
+    let slot: Rc<Cell<Option<std::task::LocalWaker>>> = Rc::new(Cell::new(None));
 
     let _handle = rt.spawn(ParkAndShare {
         slot: Rc::clone(&slot),

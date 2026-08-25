@@ -1,3 +1,5 @@
+#![feature(local_waker)]
+
 //! Not a real example; exists only so `cargo asm` has a concrete future type
 //! to monomorphize the task machinery against for codegen inspection.
 
@@ -20,7 +22,7 @@ impl Future for DummyFuture {
             Poll::Ready(())
         } else {
             self.polled = true;
-            cx.waker().wake_by_ref();
+            cx.local_waker().wake_by_ref();
             Poll::Pending
         }
     }

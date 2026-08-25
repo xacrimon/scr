@@ -13,12 +13,12 @@ use std::mem;
 use std::panic::{self, AssertUnwindSafe, Location};
 use std::pin::Pin;
 use std::ptr::NonNull;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, ContextBuilder, LocalWaker, Poll};
 use std::{cell, fmt};
 
 use crate::runtime::context;
 use crate::runtime::task::state::{CallerRef, State, TransitionToIdle, TransitionToRunning};
-use crate::runtime::task::waker::waker_ref;
+use crate::runtime::task::waker::{waker_ref, waker_ref_local};
 use crate::runtime::task::{Id, JoinError, Runnable, Task};
 
 /// The heap allocation backing a task.
@@ -52,7 +52,7 @@ pub(crate) struct Header {
     /// Waker of whoever is awaiting the `JoinHandle`. The handle owns this
     /// field for as long as `JOIN_INTEREST` is set; the runtime reads it once,
     /// on completion, which cannot overlap because both happen on this thread.
-    waker: cell::UnsafeCell<Option<Waker>>,
+    waker: cell::UnsafeCell<Option<LocalWaker>>,
 }
 
 /// The future and its result share a slot: the future is dropped before the
@@ -240,7 +240,7 @@ impl Header {
     ///
     /// Only the `JoinHandle` may call this, and only while `JOIN_INTEREST` is
     /// set.
-    pub(super) unsafe fn set_waker(&self, waker: Option<Waker>) {
+    pub(super) unsafe fn set_waker(&self, waker: Option<LocalWaker>) {
         // Safety: the caller is the only accessor of the field.
         unsafe { *self.waker.get() = waker };
     }
@@ -250,7 +250,7 @@ impl Header {
     /// # Safety
     ///
     /// See [`Header::set_waker`].
-    pub(super) unsafe fn will_wake(&self, waker: &Waker) -> bool {
+    pub(super) unsafe fn will_wake(&self, waker: &LocalWaker) -> bool {
         // Safety: the caller is the only accessor of the field.
         match unsafe { &*self.waker.get() } {
             Some(stored) => stored.will_wake(waker),
@@ -381,8 +381,8 @@ unsafe fn poll<T: Future>(ptr: NonNull<Header>) {
     match raw.state().transition_to_running() {
         TransitionToRunning::Polled => {
             // Safety: this reference to the task outlives the borrow.
-            let waker = unsafe { waker_ref(ptr) };
-            let cx = Context::from_waker(&waker);
+            let (waker, local_waker) = unsafe { (waker_ref(ptr), waker_ref_local(ptr)) };
+            let cx = ContextBuilder::from_waker(&waker).local_waker(&local_waker).build();
 
             // Safety: the poll lock is held and the future type matches.
             if unsafe { poll_future::<T>(ptr, cx) }.is_ready() {

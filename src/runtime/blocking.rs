@@ -4,7 +4,7 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
-use std::task::{RawWaker, RawWakerVTable, Waker};
+use std::task::{LocalWaker, RawWaker, RawWakerVTable, Waker};
 
 /// A flag recording whether the blocked-on future has been woken.
 ///
@@ -31,6 +31,14 @@ impl Signal {
         unsafe { Waker::from_raw(RawWaker::new(ptr, &VTABLE)) }
     }
 
+    pub(super) fn waker_local(&self) -> LocalWaker {
+        let ptr = Rc::into_raw(Rc::clone(&self.notified)).cast::<()>();
+
+        // Safety: the vtable below only ever handles pointers produced by
+        // `Rc::into_raw` on an `Rc<Cell<bool>>`.
+        unsafe { LocalWaker::from_raw(RawWaker::new(ptr, &VTABLE_LOCAL)) }
+    }
+
     pub(super) fn is_notified(&self) -> bool {
         self.notified.get()
     }
@@ -43,20 +51,38 @@ impl Signal {
 
 static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_waker);
 
-unsafe fn clone(ptr: *const ()) -> RawWaker {
-    unsafe { Rc::increment_strong_count(ptr.cast::<Cell<bool>>()) };
-    RawWaker::new(ptr, &VTABLE)
+unsafe fn clone(_ptr: *const ()) -> RawWaker {
+    panic!("clone");
 }
 
-unsafe fn wake(ptr: *const ()) {
+unsafe fn wake(_ptr: *const ()) {
+    panic!("wake");
+}
+
+unsafe fn wake_by_ref(_ptr: *const ()) {
+    panic!("wake_by_ref");
+}
+
+unsafe fn drop_waker(_ptr: *const ()) {
+    panic!("drop_waker");
+}
+
+static VTABLE_LOCAL: RawWakerVTable = RawWakerVTable::new(clone_local, wake_local, wake_by_ref_local, drop_waker_local);
+
+unsafe fn clone_local(ptr: *const ()) -> RawWaker {
+    unsafe { Rc::increment_strong_count(ptr.cast::<Cell<bool>>()) };
+    RawWaker::new(ptr, &VTABLE_LOCAL)
+}
+
+unsafe fn wake_local(ptr: *const ()) {
     let notified = unsafe { Rc::from_raw(ptr.cast::<Cell<bool>>()) };
     notified.set(true);
 }
 
-unsafe fn wake_by_ref(ptr: *const ()) {
+unsafe fn wake_by_ref_local(ptr: *const ()) {
     unsafe { (*ptr.cast::<Cell<bool>>()).set(true) };
 }
 
-unsafe fn drop_waker(ptr: *const ()) {
+unsafe fn drop_waker_local(ptr: *const ()) {
     drop(unsafe { Rc::from_raw(ptr.cast::<Cell<bool>>()) });
 }

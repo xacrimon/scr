@@ -45,7 +45,7 @@ pub async fn yield_now() {
 
             // Put ourselves back on the run queue behind everything that is
             // already there.
-            cx.waker().wake_by_ref();
+            cx.local_waker().wake_by_ref();
 
             Poll::Pending
         }

@@ -7,7 +7,7 @@ mod blocking;
 use std::marker::PhantomData;
 use std::panic::Location;
 use std::pin::pin;
-use std::task::{Context, Poll};
+use std::task::{Context, ContextBuilder, Poll};
 
 use self::sched::Handle;
 use self::task::JoinHandle;
@@ -66,8 +66,8 @@ impl Runtime {
 
         let mut future = pin!(future);
         let signal = blocking::Signal::new();
-        let waker = signal.waker();
-        let mut cx = Context::from_waker(&waker);
+        let (waker, local_waker) = (signal.waker(), signal.waker_local());
+        let mut cx = ContextBuilder::from_waker(&waker).local_waker(&local_waker).build();
 
         loop {
             // Only poll the blocked-on future when it has actually been woken.
