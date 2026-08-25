@@ -6,8 +6,6 @@
 //! back to a [`Cell<T>`].
 
 use std::any::Any;
-#[cfg(not(debug_assertions))]
-use std::hint;
 use std::marker::PhantomData;
 use std::mem;
 use std::panic::{self, AssertUnwindSafe, Location};
@@ -425,10 +423,7 @@ unsafe fn poll_future<T: Future>(ptr: NonNull<Header>, mut cx: Context<'_>) -> P
         // task is heap allocated and never moved.
         let output = unsafe {
             let Stage::Running(future) = &mut *stage_of::<T>(ptr).get() else {
-                #[cfg(debug_assertions)]
                 unreachable!("polled a task that holds no future");
-                #[cfg(not(debug_assertions))]
-                hint::unreachable_unchecked();
             };
 
             Pin::new_unchecked(future).poll(&mut cx)
