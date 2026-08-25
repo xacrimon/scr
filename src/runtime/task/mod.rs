@@ -16,7 +16,7 @@
 //!    in the run queue. At most one exists at a time, which is what stops a
 //!    task from being queued twice.
 //!  * [`JoinHandle`] — the permission to await the task's result. At most one.
-//!  * [`AbortHandle`] and `Waker` — any number of either.
+//!  * [`AbortHandle`] and `LocalWaker` — any number of either.
 //!
 //! # State
 //!
@@ -38,10 +38,10 @@
 //! the `JoinHandle`; if there is none, the poll that completed the task drops
 //! the result on its way out.
 //!
-//! The waker of whoever is awaiting the task belongs to the `JoinHandle` for as
-//! long as `JOIN_INTEREST` is set. The runtime reads it once, on completion,
-//! which cannot overlap with the `JoinHandle` writing it because both happen on
-//! the same thread.
+//! The local waker of whoever is awaiting the task belongs to the `JoinHandle`
+//! for as long as `JOIN_INTEREST` is set. The runtime reads it once, on
+//! completion, which cannot overlap with the `JoinHandle` writing it because
+//! both happen on the same thread.
 //!
 //! Everything else in a task is written once, when it is created.
 //!
@@ -49,9 +49,15 @@
 //!
 //! Every task is polled and dropped on the thread that owns the runtime, so the
 //! state word is a plain `Cell<usize>` and no task type is `Send` or `Sync`.
-//! That makes a `Waker` for one of these tasks thread affine as well: waking
-//! from another thread would race on the reference count. The runtime must
-//! never hand a waker to anything that could move it off this thread.
+//! That makes a waker for one of these tasks thread affine as well: waking from
+//! another thread would race on the reference count.
+//!
+//! `Waker` promises to be `Send` and `Sync`, so the runtime cannot hand one out
+//! at all, and wakes exclusively through `LocalWaker`, which makes no such
+//! promise. A `Context` still requires a `Waker`, so every poll site pairs its
+//! `LocalWaker` with the inert stub in `runtime::stub_waker`; a future that
+//! reaches for `cx.waker()` rather than `cx.local_waker()` panics instead of
+//! silently losing its wakeup.
 //!
 //! # Re-entrancy
 //!

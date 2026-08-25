@@ -3,13 +3,15 @@ pub(crate) mod sched;
 pub(crate) mod task;
 
 mod blocking;
+mod stub_waker;
 
 use std::marker::PhantomData;
 use std::panic::Location;
 use std::pin::pin;
-use std::task::{Context, ContextBuilder, Poll};
+use std::task::{ContextBuilder, Poll};
 
 use self::sched::Handle;
+use self::stub_waker::stub_waker;
 use self::task::JoinHandle;
 
 /// How many tasks to run before checking the future passed to `block_on`
@@ -66,8 +68,11 @@ impl Runtime {
 
         let mut future = pin!(future);
         let signal = blocking::Signal::new();
-        let (waker, local_waker) = (signal.waker(), signal.waker_local());
-        let mut cx = ContextBuilder::from_waker(&waker).local_waker(&local_waker).build();
+        let waker = stub_waker();
+        let local_waker = signal.waker();
+        let mut cx = ContextBuilder::from_waker(&waker)
+            .local_waker(&local_waker)
+            .build();
 
         loop {
             // Only poll the blocked-on future when it has actually been woken.

@@ -17,8 +17,9 @@ use std::task::{Context, ContextBuilder, LocalWaker, Poll};
 use std::{cell, fmt};
 
 use crate::runtime::context;
+use crate::runtime::stub_waker::stub_waker;
 use crate::runtime::task::state::{CallerRef, State, TransitionToIdle, TransitionToRunning};
-use crate::runtime::task::waker::{waker_ref, waker_ref_local};
+use crate::runtime::task::waker::waker_ref;
 use crate::runtime::task::{Id, JoinError, Runnable, Task};
 
 /// The heap allocation backing a task.
@@ -49,7 +50,7 @@ pub(crate) struct Header {
     /// Where the task was spawned.
     pub(super) spawned_at: &'static Location<'static>,
 
-    /// Waker of whoever is awaiting the `JoinHandle`. The handle owns this
+    /// Local waker of whoever is awaiting the `JoinHandle`. The handle owns this
     /// field for as long as `JOIN_INTEREST` is set; the runtime reads it once,
     /// on completion, which cannot overlap because both happen on this thread.
     waker: cell::UnsafeCell<Option<LocalWaker>>,
@@ -381,8 +382,11 @@ unsafe fn poll<T: Future>(ptr: NonNull<Header>) {
     match raw.state().transition_to_running() {
         TransitionToRunning::Polled => {
             // Safety: this reference to the task outlives the borrow.
-            let (waker, local_waker) = unsafe { (waker_ref(ptr), waker_ref_local(ptr)) };
-            let cx = ContextBuilder::from_waker(&waker).local_waker(&local_waker).build();
+            let local_waker = unsafe { waker_ref(ptr) };
+            let waker = stub_waker();
+            let cx = ContextBuilder::from_waker(&waker)
+                .local_waker(&local_waker)
+                .build();
 
             // Safety: the poll lock is held and the future type matches.
             if unsafe { poll_future::<T>(ptr, cx) }.is_ready() {

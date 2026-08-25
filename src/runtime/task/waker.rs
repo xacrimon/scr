@@ -1,16 +1,16 @@
-//! The waker handed to a task's future while it is polled.
+//! The local waker handed to a task's future while it is polled.
 //!
-//! A waker is a reference to a task, so its data pointer is the task's header
-//! and its vtable is the single static below, shared by every task in the
-//! program.
+//! A local waker is a reference to a task, so its data pointer is the task's
+//! header and its vtable is the single static below, shared by every task in
+//! the program.
 
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
-use std::task::{LocalWaker, RawWaker, RawWakerVTable, Waker};
+use std::task::{LocalWaker, RawWaker, RawWakerVTable};
 
 use crate::runtime::task::{Header, RawTask};
 
-/// Borrows a task as a `Waker` without touching its reference count.
+/// Borrows a task as a `LocalWaker` without touching its reference count.
 ///
 /// The result must not be dropped, which is what the `ManuallyDrop` is for: no
 /// reference was taken for it, so releasing one would be a reference too many.
@@ -20,17 +20,13 @@ use crate::runtime::task::{Header, RawTask};
 ///
 /// `ptr` must point at a live task, which the caller must keep alive for as
 /// long as the returned waker is borrowed.
-pub(super) unsafe fn waker_ref(ptr: NonNull<Header>) -> ManuallyDrop<Waker> {
-    // Every task shares one vtable so that `Waker::will_wake` can compare two
-    // wakers for the same task by pointer, rather than always reporting them as
-    // different.
+pub(super) unsafe fn waker_ref(ptr: NonNull<Header>) -> ManuallyDrop<LocalWaker> {
+    // Every task shares one vtable so that `LocalWaker::will_wake` can compare
+    // two wakers for the same task by pointer, rather than always reporting
+    // them as different.
     //
     // Safety: `raw_waker` builds a waker the vtable below understands.
-    ManuallyDrop::new(unsafe { Waker::from_raw(raw_waker(ptr)) })
-}
-
-pub(super) unsafe fn waker_ref_local(ptr: NonNull<Header>) -> ManuallyDrop<LocalWaker> {
-    ManuallyDrop::new(unsafe { LocalWaker::from_raw(raw_waker_local(ptr)) })
+    ManuallyDrop::new(unsafe { LocalWaker::from_raw(raw_waker(ptr)) })
 }
 
 /// # Safety
@@ -46,48 +42,26 @@ fn raw_waker(ptr: NonNull<Header>) -> RawWaker {
     RawWaker::new(ptr.as_ptr().cast_const().cast(), &VTABLE)
 }
 
-fn raw_waker_local(ptr: NonNull<Header>) -> RawWaker {
-    RawWaker::new(ptr.as_ptr().cast_const().cast(), &VTABLE_LOCAL)
-}
-
 static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_waker);
 
-unsafe fn clone(_ptr: *const ()) -> RawWaker {
-    panic!("clone");
-}
-
-unsafe fn wake(_ptr: *const ()) {
-   panic!("wake");
-}
-
-unsafe fn wake_by_ref(_ptr: *const ()) {
-    panic!("wake_by_ref");
-}
-
-unsafe fn drop_waker(_ptr: *const ()) {
-    panic!("drop_waker");
-}
-
-static VTABLE_LOCAL: RawWakerVTable = RawWakerVTable::new(clone_local, wake_local, wake_by_ref_local, drop_waker_local);
-
-unsafe fn clone_local(ptr: *const ()) -> RawWaker {
+unsafe fn clone(ptr: *const ()) -> RawWaker {
     // Safety: see `task_of`.
     let task = unsafe { task_of(ptr) };
     task.ref_inc();
     raw_waker(task.header_ptr())
 }
 
-unsafe fn wake_local(ptr: *const ()) {
+unsafe fn wake(ptr: *const ()) {
     // Safety: see `task_of`; this waker's reference is consumed.
     unsafe { task_of(ptr) }.wake_by_val();
 }
 
-unsafe fn wake_by_ref_local(ptr: *const ()) {
+unsafe fn wake_by_ref(ptr: *const ()) {
     // Safety: see `task_of`.
     unsafe { task_of(ptr) }.wake_by_ref();
 }
 
-unsafe fn drop_waker_local(ptr: *const ()) {
+unsafe fn drop_waker(ptr: *const ()) {
     // Safety: see `task_of`; this waker's reference is released.
     unsafe { task_of(ptr) }.drop_reference();
 }
