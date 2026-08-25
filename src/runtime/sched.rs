@@ -6,7 +6,7 @@ use std::ptr::NonNull;
 
 use crate::runtime::task::{Header, JoinHandle, OwnedTasks, Runnable, Task};
 
-const BASE_QUEUE_SIZE: usize = 32;
+const BASE_QUEUE_CAPACITY: usize = 32;
 
 /// The state a runtime shares with every task spawned on it.
 pub(crate) struct Handle {
@@ -95,7 +95,7 @@ struct Queue {
 impl Queue {
     fn new() -> Queue {
         Queue {
-            inner: UnsafeCell::new(VecDeque::with_capacity(BASE_QUEUE_SIZE)),
+            inner: UnsafeCell::new(VecDeque::with_capacity(BASE_QUEUE_CAPACITY)),
             _not_send_or_sync: PhantomData,
         }
     }

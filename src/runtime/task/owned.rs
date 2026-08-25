@@ -17,6 +17,8 @@ use slab::Slab;
 
 use crate::runtime::task::{Header, Id, JoinHandle, Runnable, Task, new_task};
 
+const BASE_TASK_CAPACITY: usize = 32;
+
 pub(crate) struct OwnedTasks {
     inner: UnsafeCell<Inner>,
 
@@ -33,7 +35,7 @@ impl OwnedTasks {
     pub(crate) fn new() -> OwnedTasks {
         OwnedTasks {
             inner: UnsafeCell::new(Inner {
-                tasks: Slab::new(),
+                tasks: Slab::with_capacity(BASE_TASK_CAPACITY),
                 closed: false,
             }),
             _not_send_or_sync: PhantomData,
