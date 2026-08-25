@@ -1,11 +1,9 @@
 use std::any::Any;
 use std::fmt;
-use std::io;
 
 use super::Id;
 use crate::util::SyncWrapper;
 
-/// Task failed to execute to completion.
 pub struct JoinError {
     repr: Repr,
     id: Id,
@@ -31,84 +29,19 @@ impl JoinError {
         }
     }
 
-    /// Returns true if the error was caused by the task being cancelled.
     pub fn is_cancelled(&self) -> bool {
         matches!(&self.repr, Repr::Cancelled)
     }
 
-    /// Returns true if the error was caused by the task panicking.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// let rt = scr::Runtime::new();
-    ///
-    /// rt.block_on(async {
-    ///     let err = scr::spawn(async {
-    ///         panic!("boom");
-    ///     }).await.unwrap_err();
-    ///
-    ///     assert!(err.is_panic());
-    /// });
-    /// ```
     pub fn is_panic(&self) -> bool {
         matches!(&self.repr, Repr::Panic(_))
     }
 
-    /// Consumes the join error, returning the object with which the task panicked.
-    ///
-    /// # Panics
-    ///
-    /// `into_panic()` panics if the `Error` does not represent the underlying
-    /// task terminating with a panic. Use `is_panic` to check the error reason
-    /// or `try_into_panic` for a variant that does not panic.
-    ///
-    /// # Examples
-    ///
-    /// ```should_panic
-    /// use std::panic;
-    ///
-    /// let rt = scr::Runtime::new();
-    ///
-    /// rt.block_on(async {
-    ///     let err = scr::spawn(async {
-    ///         panic!("boom");
-    ///     }).await.unwrap_err();
-    ///
-    ///     if err.is_panic() {
-    ///         // Resume the panic on the main task
-    ///         panic::resume_unwind(err.into_panic());
-    ///     }
-    /// });
-    /// ```
-    #[track_caller]
     pub fn into_panic(self) -> Box<dyn Any + Send + 'static> {
         self.try_into_panic()
             .expect("`JoinError` reason is not a panic.")
     }
 
-    /// Consumes the join error, returning the object with which the task
-    /// panicked if the task terminated due to a panic. Otherwise, `self` is
-    /// returned.
-    ///
-    /// # Examples
-    ///
-    /// ```should_panic
-    /// use std::panic;
-    ///
-    /// let rt = scr::Runtime::new();
-    ///
-    /// rt.block_on(async {
-    ///     let err = scr::spawn(async {
-    ///         panic!("boom");
-    ///     }).await.unwrap_err();
-    ///
-    ///     if let Ok(reason) = err.try_into_panic() {
-    ///         // Resume the panic on the main task
-    ///         panic::resume_unwind(reason);
-    ///     }
-    /// });
-    /// ```
     pub fn try_into_panic(self) -> Result<Box<dyn Any + Send + 'static>, JoinError> {
         match self.repr {
             Repr::Panic(p) => Ok(p.into_inner()),
@@ -116,10 +49,6 @@ impl JoinError {
         }
     }
 
-    /// Returns a [task ID] that identifies the task which errored relative to
-    /// other currently spawned tasks.
-    ///
-    /// [task ID]: crate::task::Id
     pub fn id(&self) -> Id {
         self.id
     }
@@ -161,21 +90,7 @@ impl fmt::Debug for JoinError {
 
 impl std::error::Error for JoinError {}
 
-impl From<JoinError> for io::Error {
-    fn from(src: JoinError) -> io::Error {
-        io::Error::other(match src.repr {
-            Repr::Cancelled => "task was cancelled",
-            Repr::Panic(_) => "task panicked",
-        })
-    }
-}
-
 fn panic_payload_as_str(payload: &SyncWrapper<Box<dyn Any + Send>>) -> Option<&str> {
-    // Panic payloads are almost always `String` (if invoked with formatting arguments)
-    // or `&'static str` (if invoked with a string literal).
-    //
-    // Non-string panic payloads have niche use-cases,
-    // so we don't really need to worry about those.
     if let Some(s) = payload.downcast_ref_sync::<String>() {
         return Some(s);
     }

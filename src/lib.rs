@@ -1,6 +1,5 @@
 #![feature(local_waker)]
 
-mod macros;
 mod runtime;
 mod util;
 

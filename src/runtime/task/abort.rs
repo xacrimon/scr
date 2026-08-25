@@ -3,10 +3,6 @@ use std::panic::{RefUnwindSafe, UnwindSafe};
 
 use crate::runtime::task::{Id, RawTask};
 
-/// An owned permission to abort a task, without the permission to await it.
-///
-/// Dropping an `AbortHandle` gives up that permission; it does not abort the
-/// task.
 pub struct AbortHandle {
     raw: RawTask,
 }
@@ -19,23 +15,14 @@ impl AbortHandle {
         AbortHandle { raw }
     }
 
-    /// Aborts the task.
-    ///
-    /// Awaiting an aborted task may still yield its result, if it had already
-    /// finished when the abort landed; otherwise it fails with a [cancelled]
-    /// `JoinError`. Aborting a task that is already aborted does nothing.
-    ///
-    /// [cancelled]: method@super::JoinError::is_cancelled
     pub fn abort(&self) {
         self.raw.remote_abort();
     }
 
-    /// Returns whether the task has finished.
     pub fn is_finished(&self) -> bool {
         self.raw.state().load().is_complete()
     }
 
-    /// Returns the [`Id`] of the task.
     pub fn id(&self) -> Id {
         self.raw.header().id
     }

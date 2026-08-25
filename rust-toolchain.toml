@@ -1,4 +1,4 @@
 [toolchain]
 channel = "nightly-2026-08-21"
-components = ["miri", "rust-src"]
+components = ["miri", "rust-src", "rust-analyzer"]
 profile = "default"

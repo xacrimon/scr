@@ -2,21 +2,25 @@ use std::ptr;
 use std::task::{RawWaker, RawWakerVTable, Waker};
 
 pub(super) fn stub_waker() -> Waker {
-    unsafe { Waker::from_raw(RawWaker::new(ptr::null(), &VTABLE)) }
+    unsafe { Waker::from_raw(raw_stub_waker()) }
+}
+
+fn raw_stub_waker() -> RawWaker {
+    RawWaker::new(ptr::null(), &VTABLE)
 }
 
 static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_waker);
 
 unsafe fn clone(_ptr: *const ()) -> RawWaker {
-    unsupported("clone")
+    raw_stub_waker()
 }
 
 unsafe fn wake(_ptr: *const ()) {
-    unsupported("wake")
+    unsupported("wake");
 }
 
 unsafe fn wake_by_ref(_ptr: *const ()) {
-    unsupported("wake_by_ref")
+    unsupported("wake_by_ref");
 }
 
 unsafe fn drop_waker(_ptr: *const ()) {}

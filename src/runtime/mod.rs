@@ -2,7 +2,7 @@ pub(crate) mod context;
 pub(crate) mod sched;
 pub(crate) mod task;
 
-mod blocking;
+mod blocked_on;
 mod stub_waker;
 
 use std::marker::PhantomData;
@@ -14,40 +14,24 @@ use self::sched::Handle;
 use self::stub_waker::stub_waker;
 use self::task::JoinHandle;
 
-/// How many tasks to run before checking the future passed to `block_on`
-/// again.
 const EVENT_INTERVAL: u32 = 61;
 
-/// A single threaded runtime.
-///
-/// The runtime, every task spawned on it, and every waker handed out by it are
-/// bound to the thread that created it. `Runtime` is therefore neither `Send`
-/// nor `Sync`.
 pub struct Runtime {
     handle: Handle,
-
-    /// The runtime is thread affine; see the task module docs.
-    _not_send_or_sync: PhantomData<*const ()>,
+    _marker: PhantomData<*const ()>,
 }
 
 impl Runtime {
-    /// Creates a new runtime.
-    pub fn new() -> Runtime {
-        Runtime {
+    pub fn new() -> Self {
+        Self {
             handle: Handle::new(),
-            _not_send_or_sync: PhantomData,
+            _marker: PhantomData,
         }
     }
-
-    /// Spawns a task onto the runtime.
-    ///
-    /// The task starts running as soon as the runtime next polls its run
-    /// queue; it does not run at the point of the `spawn` call.
     #[track_caller]
-    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    pub fn spawn<F>(&self, future: F) -> JoinHandle
     where
-        F: Future + 'static,
-        F::Output: 'static,
+        F: Future<Output = ()> + 'static,
     {
         let spawned_at = Location::caller();
         let _enter = context::enter(&self.handle);
@@ -55,19 +39,11 @@ impl Runtime {
         self.handle.spawn(future, spawned_at)
     }
 
-    /// Runs a future to completion, driving any spawned tasks in the meantime.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the runtime runs out of work while `future` is still pending.
-    /// Since there is no I/O or timer driver yet, and wakers cannot leave this
-    /// thread, nothing could ever wake the future at that point, so this would
-    /// otherwise be a silent hang.
     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
         let _enter = context::enter(&self.handle);
 
         let mut future = pin!(future);
-        let signal = blocking::Signal::new();
+        let signal = blocked_on::Signal::new();
         let waker = stub_waker();
         let local_waker = signal.waker();
         let mut cx = ContextBuilder::from_waker(&waker)

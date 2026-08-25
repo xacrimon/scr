@@ -1,13 +1,21 @@
 #![feature(local_waker)]
 
-use std::cell::Cell;
-use std::future::{self, Future};
+use std::cell::{Cell, RefCell};
+use std::future;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Context, Poll};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, LocalWaker, Poll};
 
 use scr::Runtime;
 use scr::task::{self, JoinHandle};
+
+/// Tasks always finish with `()`, so a test that cares about what a task
+/// computed hands the value out through a shared slot instead.
+fn slot<T>() -> Rc<Cell<Option<T>>> {
+    Rc::new(Cell::new(None))
+}
 
 #[test]
 fn block_on_returns_output() {
@@ -18,18 +26,32 @@ fn block_on_returns_output() {
 #[test]
 fn spawn_and_join() {
     let rt = Runtime::new();
-    let out = rt.block_on(async {
-        let handle = task::spawn(async { "hello" });
-        handle.await.unwrap()
+    let out = slot::<&'static str>();
+
+    rt.block_on({
+        let out = Rc::clone(&out);
+        async move {
+            let handle = task::spawn(async move { out.set(Some("hello")) });
+            handle.await.unwrap();
+        }
     });
-    assert_eq!(out, "hello");
+
+    assert_eq!(out.take(), Some("hello"));
 }
 
 #[test]
 fn spawn_from_outside_block_on() {
     let rt = Runtime::new();
-    let handle = rt.spawn(async { 7 });
-    assert_eq!(rt.block_on(handle).unwrap(), 7);
+    let out = slot::<u32>();
+
+    let handle = {
+        let out = Rc::clone(&out);
+        rt.spawn(async move { out.set(Some(7)) })
+    };
+
+    rt.block_on(handle).unwrap();
+
+    assert_eq!(out.take(), Some(7));
 }
 
 #[test]
@@ -62,12 +84,20 @@ fn tasks_run_in_spawn_order() {
 #[test]
 fn nested_spawn() {
     let rt = Runtime::new();
-    let out = rt.block_on(async {
-        task::spawn(async { task::spawn(async { 42 }).await.unwrap() })
+    let out = slot::<u32>();
+
+    rt.block_on({
+        let out = Rc::clone(&out);
+        async move {
+            task::spawn(async move {
+                task::spawn(async move { out.set(Some(42)) }).await.unwrap();
+            })
             .await
-            .unwrap()
+            .unwrap();
+        }
     });
-    assert_eq!(out, 42);
+
+    assert_eq!(out.take(), Some(42));
 }
 
 #[test]
@@ -88,11 +118,10 @@ fn detached_task_still_runs() {
     assert!(ran.get());
 }
 
+/// A task's future is dropped as soon as it finishes, without waiting for the
+/// `JoinHandle` to be awaited or dropped.
 #[test]
-fn join_handle_dropped_after_completion() {
-    let rt = Runtime::new();
-    let dropped = Rc::new(Cell::new(false));
-
+fn a_finished_task_drops_its_future() {
     struct OnDrop(Rc<Cell<bool>>);
     impl Drop for OnDrop {
         fn drop(&mut self) {
@@ -100,16 +129,22 @@ fn join_handle_dropped_after_completion() {
         }
     }
 
+    let rt = Runtime::new();
+    let dropped = Rc::new(Cell::new(false));
+
     rt.block_on({
         let dropped = Rc::clone(&dropped);
         async move {
-            let handle = task::spawn(async move { OnDrop(dropped) });
+            let guard = OnDrop(dropped);
+            let handle = task::spawn(async move {
+                let _guard = guard;
+            });
 
-            // Let the task complete and store its output.
+            // Let the task complete.
             task::yield_now().await;
             task::yield_now().await;
 
-            // Dropping the handle must drop the stored output.
+            assert!(handle.is_finished());
             drop(handle);
         }
     });
@@ -122,7 +157,7 @@ fn task_panic_is_reported_to_join_handle() {
     let rt = Runtime::new();
 
     let err = rt.block_on(async {
-        let handle: JoinHandle<()> = task::spawn(async { panic!("boom") });
+        let handle = task::spawn(async { panic!("boom") });
         handle.await.unwrap_err()
     });
 
@@ -131,6 +166,41 @@ fn task_panic_is_reported_to_join_handle() {
     assert_eq!(
         err.into_panic().downcast_ref::<&'static str>().copied(),
         Some("boom")
+    );
+}
+
+/// A detached task that panics has nowhere to report to; the payload is dropped
+/// on the completion path rather than leaking.
+#[test]
+fn a_detached_task_that_panics_swallows_the_panic() {
+    // The payload must be `Send`, so the flag it sets is an atomic rather than
+    // the `Rc<Cell<_>>` the other tests use.
+    struct OnDrop(Arc<AtomicBool>);
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    let rt = Runtime::new();
+    let payload_dropped = Arc::new(AtomicBool::new(false));
+
+    rt.block_on({
+        let payload_dropped = Arc::clone(&payload_dropped);
+        async move {
+            // The payload carries a value whose destructor the test observes.
+            drop(task::spawn(async move {
+                std::panic::panic_any(OnDrop(payload_dropped));
+            }));
+
+            task::yield_now().await;
+            task::yield_now().await;
+        }
+    });
+
+    assert!(
+        payload_dropped.load(Ordering::Relaxed),
+        "the panic payload of a detached task must be dropped"
     );
 }
 
@@ -159,7 +229,7 @@ fn abort_pending_task() {
     let rt = Runtime::new();
 
     let err = rt.block_on(async {
-        let handle: JoinHandle<()> = task::spawn(future::pending());
+        let handle = task::spawn(future::pending::<()>());
 
         // Let the task be polled once so that it parks.
         task::yield_now().await;
@@ -176,7 +246,7 @@ fn abort_handle_clone_and_id() {
     let rt = Runtime::new();
 
     rt.block_on(async {
-        let handle: JoinHandle<()> = task::spawn(future::pending());
+        let handle = task::spawn(future::pending::<()>());
         let abort = handle.abort_handle();
         let abort2 = abort.clone();
 
@@ -211,14 +281,23 @@ fn completed_task_is_finished() {
 #[test]
 fn task_id_is_visible_from_inside_the_task() {
     let rt = Runtime::new();
+    let seen = slot::<scr::task::Id>();
 
-    rt.block_on(async {
-        // `block_on` is not a task.
-        assert!(task::try_id().is_none());
+    rt.block_on({
+        let seen = Rc::clone(&seen);
+        async move {
+            // `block_on` is not a task.
+            assert!(task::try_id().is_none());
 
-        let handle = task::spawn(async { task::id() });
-        let outer = handle.id();
-        assert_eq!(handle.await.unwrap(), outer);
+            let handle = {
+                let seen = Rc::clone(&seen);
+                task::spawn(async move { seen.set(Some(task::id())) })
+            };
+            let outer = handle.id();
+            handle.await.unwrap();
+
+            assert_eq!(seen.get(), Some(outer));
+        }
     });
 }
 
@@ -271,16 +350,18 @@ fn waking_a_parked_task_reschedules_it() {
     /// Returns `Pending` on the first poll, storing its waker; the waker is
     /// invoked by the test to reschedule the task.
     struct WakeMeOnce {
-        waker: Rc<Cell<Option<std::task::LocalWaker>>>,
+        waker: Rc<Cell<Option<LocalWaker>>>,
+        repolled: Rc<Cell<bool>>,
         polled: bool,
     }
 
     impl Future for WakeMeOnce {
-        type Output = u32;
+        type Output = ();
 
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
             if self.polled {
-                return Poll::Ready(99);
+                self.repolled.set(true);
+                return Poll::Ready(());
             }
 
             self.polled = true;
@@ -289,22 +370,28 @@ fn waking_a_parked_task_reschedules_it() {
         }
     }
 
-    let out = rt.block_on(async {
-        let waker: Rc<Cell<Option<std::task::LocalWaker>>> = Rc::new(Cell::new(None));
-        let handle = task::spawn(WakeMeOnce {
-            waker: Rc::clone(&waker),
-            polled: false,
-        });
+    let repolled = Rc::new(Cell::new(false));
 
-        // Let the task park.
-        task::yield_now().await;
+    rt.block_on({
+        let repolled = Rc::clone(&repolled);
+        async move {
+            let waker: Rc<Cell<Option<LocalWaker>>> = Rc::new(Cell::new(None));
+            let handle = task::spawn(WakeMeOnce {
+                waker: Rc::clone(&waker),
+                repolled,
+                polled: false,
+            });
 
-        waker.take().expect("task should have parked").wake();
+            // Let the task park.
+            task::yield_now().await;
 
-        handle.await.unwrap()
+            waker.take().expect("task should have parked").wake();
+
+            handle.await.unwrap();
+        }
     });
 
-    assert_eq!(out, 99);
+    assert!(repolled.get());
 }
 
 #[test]
@@ -368,7 +455,7 @@ fn task_aborting_itself_defers_the_drop() {
         async move {
             let slot: Rc<Cell<Option<scr::task::AbortHandle>>> = Rc::new(Cell::new(None));
 
-            let handle: JoinHandle<()> = {
+            let handle = {
                 let slot = Rc::clone(&slot);
                 task::spawn(async move {
                     let _guard = OnDrop(Rc::clone(&dropped));
@@ -395,6 +482,39 @@ fn task_aborting_itself_defers_the_drop() {
     assert!(dropped.get(), "the future is dropped once the poll returns");
 }
 
+/// A task that requests its own cancellation and then finishes anyway in that
+/// same poll ran to completion, so it reports success. The cancellation flag is
+/// still set when the task completes, so it must not be mistaken for the
+/// outcome.
+#[test]
+fn a_task_that_aborts_itself_and_then_finishes_reports_success() {
+    let rt = Runtime::new();
+    let ran = Rc::new(Cell::new(false));
+
+    rt.block_on({
+        let ran = Rc::clone(&ran);
+        async move {
+            let slot: Rc<Cell<Option<scr::task::AbortHandle>>> = Rc::new(Cell::new(None));
+
+            let handle = {
+                let slot = Rc::clone(&slot);
+                task::spawn(async move {
+                    slot.take().unwrap().abort();
+
+                    // Returns `Ready` in the very poll that asked to be
+                    // cancelled, so the cancellation never takes effect.
+                    ran.set(true);
+                })
+            };
+
+            slot.set(Some(handle.abort_handle()));
+            handle.await.unwrap();
+        }
+    });
+
+    assert!(ran.get());
+}
+
 /// Repeated wakes of a parked task must collapse into a single re-poll.
 #[test]
 fn repeated_wakes_queue_the_task_once() {
@@ -403,17 +523,17 @@ fn repeated_wakes_queue_the_task_once() {
 
     struct CountPolls {
         polls: Rc<Cell<u32>>,
-        waker: Rc<Cell<Option<std::task::LocalWaker>>>,
+        waker: Rc<Cell<Option<LocalWaker>>>,
     }
 
     impl Future for CountPolls {
-        type Output = u32;
+        type Output = ();
 
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
             self.polls.set(self.polls.get() + 1);
 
             if self.polls.get() >= 2 {
-                return Poll::Ready(self.polls.get());
+                return Poll::Ready(());
             }
 
             self.waker.set(Some(cx.local_waker().clone()));
@@ -421,10 +541,10 @@ fn repeated_wakes_queue_the_task_once() {
         }
     }
 
-    let total = rt.block_on({
+    rt.block_on({
         let polls = Rc::clone(&polls);
         async move {
-            let waker: Rc<Cell<Option<std::task::LocalWaker>>> = Rc::new(Cell::new(None));
+            let waker: Rc<Cell<Option<LocalWaker>>> = Rc::new(Cell::new(None));
             let handle = task::spawn(CountPolls {
                 polls: Rc::clone(&polls),
                 waker: Rc::clone(&waker),
@@ -438,11 +558,15 @@ fn repeated_wakes_queue_the_task_once() {
                 waker.wake_by_ref();
             }
 
-            handle.await.unwrap()
+            handle.await.unwrap();
         }
     });
 
-    assert_eq!(total, 2, "five wakes must produce exactly one re-poll");
+    assert_eq!(
+        polls.get(),
+        2,
+        "five wakes must produce exactly one re-poll"
+    );
 }
 
 /// A task that wakes itself *by value* from inside its own poll must be
@@ -450,19 +574,20 @@ fn repeated_wakes_queue_the_task_once() {
 #[test]
 fn self_wake_by_value_during_poll() {
     let rt = Runtime::new();
+    let polls = Rc::new(Cell::new(0u32));
 
     struct SelfWake {
-        polls: u32,
+        polls: Rc<Cell<u32>>,
     }
 
     impl Future for SelfWake {
-        type Output = u32;
+        type Output = ();
 
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
-            self.polls += 1;
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            self.polls.set(self.polls.get() + 1);
 
-            if self.polls >= 3 {
-                return Poll::Ready(self.polls);
+            if self.polls.get() >= 3 {
+                return Poll::Ready(());
             }
 
             // `wake`, not `wake_by_ref`: this consumes a ref-count while the
@@ -474,9 +599,14 @@ fn self_wake_by_value_during_poll() {
         }
     }
 
-    let polls = rt.block_on(async { task::spawn(SelfWake { polls: 0 }).await.unwrap() });
+    rt.block_on({
+        let polls = Rc::clone(&polls);
+        async move {
+            task::spawn(SelfWake { polls }).await.unwrap();
+        }
+    });
 
-    assert_eq!(polls, 3);
+    assert_eq!(polls.get(), 3);
 }
 
 /// The task registry is a slab, so the slot a finished task occupied is handed
@@ -487,32 +617,36 @@ fn self_wake_by_value_during_poll() {
 #[test]
 fn registry_slots_are_reused_as_tasks_complete() {
     let rt = Runtime::new();
+    let seen: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
 
-    let out = rt.block_on(async {
-        let mut parked: Vec<JoinHandle<()>> = Vec::new();
-        let mut seen = Vec::new();
+    rt.block_on({
+        let seen = Rc::clone(&seen);
+        async move {
+            let mut parked: Vec<JoinHandle> = Vec::new();
 
-        for wave in 0..4u32 {
-            // Never completes, so it holds its slot for the rest of the test.
-            parked.push(task::spawn(future::pending::<()>()));
+            for wave in 0..4u32 {
+                // Never completes, so it holds its slot for the rest of the test.
+                parked.push(task::spawn(future::pending::<()>()));
 
-            let handles: Vec<JoinHandle<u32>> = (0..8u32)
-                .map(|i| task::spawn(async move { wave * 8 + i }))
-                .collect();
+                let handles: Vec<JoinHandle> = (0..8u32)
+                    .map(|i| {
+                        let seen = Rc::clone(&seen);
+                        task::spawn(async move { seen.borrow_mut().push(wave * 8 + i) })
+                    })
+                    .collect();
 
-            for handle in handles {
-                seen.push(handle.await.unwrap());
+                for handle in handles {
+                    handle.await.unwrap();
+                }
+            }
+
+            for handle in &parked {
+                assert!(!handle.is_finished(), "the parked tasks must still be live");
             }
         }
-
-        for handle in &parked {
-            assert!(!handle.is_finished(), "the parked tasks must still be live");
-        }
-
-        seen
     });
 
-    assert_eq!(out, (0..32).collect::<Vec<u32>>());
+    assert_eq!(seen.take(), (0..32).collect::<Vec<u32>>());
 
     // Dropping the runtime now shuts down four parked tasks that sit in a slab
     // full of recycled and vacant slots.
@@ -554,7 +688,7 @@ fn shutdown_kills_a_task_that_is_still_queued() {
 /// the run queue, which the shutdown loop then drains.
 #[test]
 fn a_destructor_may_wake_another_task_during_shutdown() {
-    struct WakeOnDrop(Rc<Cell<Option<std::task::LocalWaker>>>);
+    struct WakeOnDrop(Rc<Cell<Option<LocalWaker>>>);
     impl Drop for WakeOnDrop {
         fn drop(&mut self) {
             if let Some(waker) = self.0.take() {
@@ -565,7 +699,7 @@ fn a_destructor_may_wake_another_task_during_shutdown() {
 
     /// Parks on the first poll, leaving its waker in `slot`.
     struct ParkAndShare {
-        slot: Rc<Cell<Option<std::task::LocalWaker>>>,
+        slot: Rc<Cell<Option<LocalWaker>>>,
     }
 
     impl Future for ParkAndShare {
@@ -578,7 +712,7 @@ fn a_destructor_may_wake_another_task_during_shutdown() {
     }
 
     let rt = Runtime::new();
-    let slot: Rc<Cell<Option<std::task::LocalWaker>>> = Rc::new(Cell::new(None));
+    let slot: Rc<Cell<Option<LocalWaker>>> = Rc::new(Cell::new(None));
     let woke = Rc::new(Cell::new(false));
 
     // The waker is spawned first so that it is shut down first, while the task
@@ -629,18 +763,22 @@ fn two_runtimes_on_one_thread_are_independent() {
     let a = Runtime::new();
     let b = Runtime::new();
 
-    assert_eq!(
-        a.block_on(async { task::spawn(async { 1 }).await.unwrap() }),
-        1
-    );
-    assert_eq!(
-        b.block_on(async { task::spawn(async { 2 }).await.unwrap() }),
-        2
-    );
-    assert_eq!(
-        a.block_on(async { task::spawn(async { 3 }).await.unwrap() }),
-        3
-    );
+    let seen = Rc::new(RefCell::new(Vec::new()));
+
+    let run = |rt: &Runtime, n: u32| {
+        let seen = Rc::clone(&seen);
+        rt.block_on(async move {
+            task::spawn(async move { seen.borrow_mut().push(n) })
+                .await
+                .unwrap();
+        });
+    };
+
+    run(&a, 1);
+    run(&b, 2);
+    run(&a, 3);
+
+    assert_eq!(seen.take(), vec![1, 2, 3]);
 }
 
 /// A task's waker may only be fired while its runtime is entered, since that is
@@ -649,7 +787,7 @@ fn two_runtimes_on_one_thread_are_independent() {
 #[should_panic(expected = "outside of a runtime")]
 fn waking_a_task_outside_of_a_runtime_panics() {
     struct ParkAndShare {
-        slot: Rc<Cell<Option<std::task::LocalWaker>>>,
+        slot: Rc<Cell<Option<LocalWaker>>>,
     }
 
     impl Future for ParkAndShare {
@@ -662,7 +800,7 @@ fn waking_a_task_outside_of_a_runtime_panics() {
     }
 
     let rt = Runtime::new();
-    let slot: Rc<Cell<Option<std::task::LocalWaker>>> = Rc::new(Cell::new(None));
+    let slot: Rc<Cell<Option<LocalWaker>>> = Rc::new(Cell::new(None));
 
     let _handle = rt.spawn(ParkAndShare {
         slot: Rc::clone(&slot),
@@ -679,7 +817,7 @@ fn waking_a_task_outside_of_a_runtime_panics() {
 fn handles_outliving_the_runtime_are_inert() {
     let rt = Runtime::new();
 
-    let handle: JoinHandle<()> = rt.spawn(future::pending());
+    let handle = rt.spawn(future::pending::<()>());
     let abort = handle.abort_handle();
 
     rt.block_on(async { task::yield_now().await });
@@ -708,7 +846,7 @@ fn a_panic_while_cancelling_is_reported_as_a_panic() {
     let rt = Runtime::new();
 
     let err = rt.block_on(async {
-        let handle: JoinHandle<()> = task::spawn(async {
+        let handle = task::spawn(async {
             let _guard = PanicOnDrop;
             future::pending::<()>().await;
         });
@@ -722,21 +860,29 @@ fn a_panic_while_cancelling_is_reported_as_a_panic() {
     assert!(!err.is_cancelled());
 }
 
-/// Aborting a task that has already finished must leave its result alone.
+/// Aborting a task that has already finished must leave its result alone: the
+/// cancellation flag is what a completed task reports, so setting it late would
+/// turn a success into a cancellation.
 #[test]
 fn aborting_a_finished_task_does_nothing() {
     let rt = Runtime::new();
+    let ran = Rc::new(Cell::new(false));
 
-    rt.block_on(async {
-        let handle = task::spawn(async { 7 });
+    rt.block_on({
+        let ran = Rc::clone(&ran);
+        async move {
+            let handle = task::spawn(async move { ran.set(true) });
 
-        task::yield_now().await;
-        task::yield_now().await;
-        assert!(handle.is_finished());
+            task::yield_now().await;
+            task::yield_now().await;
+            assert!(handle.is_finished());
 
-        handle.abort_handle().abort();
-        assert_eq!(handle.await.unwrap(), 7);
+            handle.abort_handle().abort();
+            handle.await.unwrap();
+        }
     });
+
+    assert!(ran.get());
 }
 
 /// A task's result can only be taken once, and asking twice is a bug worth
@@ -747,8 +893,8 @@ fn polling_a_join_handle_after_taking_its_result_panics() {
     let rt = Runtime::new();
 
     rt.block_on(async {
-        let mut handle = task::spawn(async { 1 });
-        assert_eq!((&mut handle).await.unwrap(), 1);
+        let mut handle = task::spawn(async {});
+        (&mut handle).await.unwrap();
 
         let _ = (&mut handle).await;
     });
@@ -778,7 +924,7 @@ fn a_destructor_that_panics_after_a_failed_poll_is_swallowed() {
     let rt = Runtime::new();
 
     let err = rt.block_on(async {
-        let handle: JoinHandle<()> = task::spawn(PanicOnPollAndDrop);
+        let handle = task::spawn(PanicOnPollAndDrop);
         handle.await.unwrap_err()
     });
 
@@ -791,17 +937,17 @@ fn a_destructor_that_panics_after_a_failed_poll_is_swallowed() {
 }
 
 /// A future that finishes and then panics on the way out is reported as a
-/// panic. Its result never reaches the `JoinHandle`, and the task still
-/// completes rather than being left holding the poll lock.
+/// panic. The task still completes rather than being left holding the poll
+/// lock.
 #[test]
 fn a_destructor_that_panics_after_a_ready_poll_is_reported() {
     struct PanicOnDrop;
 
     impl Future for PanicOnDrop {
-        type Output = u32;
+        type Output = ();
 
-        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<u32> {
-            Poll::Ready(5)
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            Poll::Ready(())
         }
     }
 

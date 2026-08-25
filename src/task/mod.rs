@@ -15,10 +15,9 @@ use crate::runtime::context;
 ///
 /// Panics if called from outside of a runtime.
 #[track_caller]
-pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+pub fn spawn<F>(future: F) -> JoinHandle
 where
-    F: Future + 'static,
-    F::Output: 'static,
+    F: Future<Output = ()> + 'static,
 {
     let spawned_at = Location::caller();
 
