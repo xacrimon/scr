@@ -309,6 +309,118 @@ impl Ring {
         self.enter_flags |= sys::EnterFlags::REGISTERED_RING;
         Ok(())
     }
+
+    /// Register `nr` empty direct descriptor slots.
+    ///
+    /// The table's size is fixed here for the life of the registration: there is
+    /// no register operation that grows it, and re-registering over a live table
+    /// fails with `EBUSY`. Growing means [`Ring::unregister_files`] first, which
+    /// drops every descriptor in it, so pick a capacity that covers the peak.
+    ///
+    /// `nr` counts against `RLIMIT_NOFILE` even though the slots are empty, so a
+    /// table larger than the soft limit fails with `EMFILE`. liburing raises the
+    /// limit and retries; this does not, because the limit is process-wide state
+    /// a library has no business editing.
+    ///
+    /// See [`fixed::FixedFiles`](super::fixed::FixedFiles), which pairs this
+    /// with a slot allocator.
+    pub fn register_files_sparse(&self, nr: u32) -> Result<(), Errno> {
+        let reg = sys::RsrcRegister {
+            nr,
+            flags: sys::RsrcRegisterFlags::SPARSE,
+            ..Default::default()
+        };
+        // SAFETY: `reg` is a live, correctly typed argument for FILES2, and the
+        // kernel takes its size in `nr_args` rather than an element count. It
+        // borrows nothing: the table is allocated from `nr` alone.
+        unsafe {
+            self.register(
+                sys::RegisterOp::Files2,
+                std::ptr::from_ref(&reg).cast(),
+                size_of::<sys::RsrcRegister>() as u32,
+            )?
+        };
+        Ok(())
+    }
+
+    /// Register `fds` as the direct descriptor table, slot `i` naming `fds[i]`.
+    ///
+    /// A `-1` entry leaves the slot empty. As with [`Ring::register_files_sparse`]
+    /// the length fixes the table size.
+    pub fn register_files(&self, fds: &[i32]) -> Result<(), Errno> {
+        // SAFETY: `fds` is live for the call and `nr_args` is its true length.
+        // The kernel resolves every descriptor before returning and keeps no
+        // reference to the array itself.
+        unsafe {
+            self.register(
+                sys::RegisterOp::Files,
+                fds.as_ptr().cast(),
+                fds.len() as u32,
+            )?
+        };
+        Ok(())
+    }
+
+    /// Install `fds` into consecutive slots starting at `offset`, returning how
+    /// many were updated.
+    ///
+    /// A `-1` entry empties the slot; [`sys::REGISTER_FILES_SKIP`] leaves it as
+    /// it was. Installing over an occupied slot replaces it silently, so the
+    /// caller is responsible for knowing the slot is free.
+    pub fn update_files(&self, offset: u32, fds: &[i32]) -> Result<u32, Errno> {
+        let up = sys::RsrcUpdate {
+            offset,
+            resv: 0,
+            data: fds.as_ptr() as u64,
+        };
+        // SAFETY: `up` points at `fds`, which outlives the call, and `nr_args`
+        // matches its length. As with registration the kernel copies out during
+        // the call.
+        unsafe {
+            self.register(
+                sys::RegisterOp::FilesUpdate,
+                std::ptr::from_ref(&up).cast(),
+                fds.len() as u32,
+            )
+        }
+    }
+
+    /// Drop the direct descriptor table, closing every descriptor in it.
+    ///
+    /// Fails with [`Errno::NXIO`] if no table is registered.
+    pub fn unregister_files(&self) -> Result<(), Errno> {
+        // SAFETY: this operation takes no argument.
+        unsafe { self.register(sys::RegisterOp::UnregisterFiles, std::ptr::null(), 0)? };
+        Ok(())
+    }
+
+    /// Confine the kernel's own slot allocator to `[off, off + len)`.
+    ///
+    /// This bounds [`sys::FILE_INDEX_ALLOC`] only; an operation naming a slot
+    /// outright may still target any slot in the table. Partitioning this way
+    /// lets a multishot accept allocate for itself out of one region while the
+    /// caller hands out slots from the other without the two colliding.
+    ///
+    /// The range is validated against the registered table, so it must be set
+    /// after [`Ring::register_files_sparse`] and is undone by
+    /// [`Ring::unregister_files`].
+    pub fn set_file_alloc_range(&self, off: u32, len: u32) -> Result<(), Errno> {
+        let range = sys::FileIndexRange {
+            off,
+            len,
+            ..Default::default()
+        };
+        // SAFETY: `range` is a live, correctly typed argument for
+        // FILE_ALLOC_RANGE, which takes no element count.
+        unsafe {
+            self.register(
+                sys::RegisterOp::FileAllocRange,
+                std::ptr::from_ref(&range).cast(),
+                0,
+            )?
+        };
+        Ok(())
+    }
 }
 
 impl Drop for Ring {

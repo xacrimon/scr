@@ -22,7 +22,7 @@
 //! | required pointer | `NonNull<T>` |
 //! | optional pointer | `Option<NonNull<T>>` |
 //! | pointers that must be set or unset together | `Option<(NonNull<A>, NonNull<B>)>` |
-//! | file descriptor | `i32` |
+//! | file descriptor | `i32`, holding a slot index when `FIXED_FILE` is set |
 //! | direct descriptor slot | `u32`, 0-based; the wire encoding is 1-based |
 //! | flag word | the matching `sys` bitflags type |
 //!
@@ -31,6 +31,30 @@
 //! first is non-null. Binding them into one value makes "both or neither" the
 //! only representable state. The same applies to values packed into the two
 //! halves of one word, such as [`UringCmd::sockopt`].
+//!
+//! # Descriptors and slots
+//!
+//! A descriptor field holds either a raw descriptor or an index into the ring's
+//! registered file table; which one it is depends entirely on
+//! [`sys::SqeFlags::FIXED_FILE`], which the caller sets:
+//!
+//! ```ignore
+//! op::Read::new()
+//!     .fd(slot as i32)
+//!     .sqe_flags(|f| f | sys::SqeFlags::FIXED_FILE)
+//! ```
+//!
+//! Mind the direction: an *input* slot in the descriptor field is 0-based,
+//! while an *output* slot in a `slot` setter is 1-based on the wire.
+//! [`Splice`] and [`Tee`] are different again — their source lives in
+//! `file_index` and is marked fixed by [`sys::SPLICE_F_FD_IN_FIXED`] in their
+//! own `flags`, not by `FIXED_FILE`.
+//!
+//! [`sqe_flags`](Read::sqe_flags) takes a transform rather than a value, so it
+//! composes with itself and with the flags [`new`](Read::new) presets on
+//! [`ReadMultishot`] and [`FixedFdInstall`] instead of overwriting them.
+//!
+//! See [`fixed`](super::fixed) for managing the table those slots index.
 //!
 //! Where two fields deliberately share one SQE word, the docs say so. `buf`
 //! writes an address and a length, and `nbytes` then narrows the length alone,
@@ -107,10 +131,17 @@ macro_rules! opcode {
 
             /// Submission flags — linking, drain, fixed file, buffer select.
             ///
+            /// Takes a transform rather than a value so that setting one flag
+            /// cannot silently drop another. Some operations arrive from
+            /// [`new`](Self::new) with a flag already set, and a descriptor
+            /// field means a registered slot only when the caller adds
+            /// [`sys::SqeFlags::FIXED_FILE`] here, as in
+            /// `op.sqe_flags(|f| f | sys::SqeFlags::FIXED_FILE)`.
+            ///
             /// Named `sqe_flags` because several operations have a `flags` of
             /// their own that lands in a different field.
-            pub fn sqe_flags(mut self, value: sys::SqeFlags) -> $name {
-                self.0.flags = value;
+            pub fn sqe_flags(mut self, f: impl FnOnce(sys::SqeFlags) -> sys::SqeFlags) -> $name {
+                self.0.flags = f(self.0.flags);
                 self
             }
 
@@ -212,14 +243,25 @@ fn optptr_dec<T>(raw: u64) -> Option<NonNull<T>> {
     NonNull::new(raw as *mut T)
 }
 
-/// Encode a direct descriptor slot, which the kernel takes 1-based so that zero
-/// can mean "not a fixed file".
+/// Encode an output slot, which the kernel takes 1-based so that zero can mean
+/// "not a fixed file".
+///
+/// [`sys::FILE_INDEX_ALLOC`] is the exception: the kernel compares it against
+/// the raw field before subtracting, so it has to go on the wire untouched.
 fn slot_encode(slot: u32) -> u32 {
-    slot.wrapping_add(1)
+    if slot == sys::FILE_INDEX_ALLOC {
+        slot
+    } else {
+        slot.wrapping_add(1)
+    }
 }
 
 fn slot_decode(raw: u32) -> u32 {
-    raw.wrapping_sub(1)
+    if raw == sys::FILE_INDEX_ALLOC {
+        raw
+    } else {
+        raw.wrapping_sub(1)
+    }
 }
 
 opcode! {
@@ -1189,7 +1231,7 @@ mod tests {
             .offset(4096)
             .rw_flags(9)
             .user_data(11)
-            .sqe_flags(sys::SqeFlags::IO_LINK)
+            .sqe_flags(|_| sys::SqeFlags::IO_LINK)
             .personality(3);
         assert_eq!(r.get_fd(), 7);
         assert_eq!(r.get_buf().cast::<u8>(), buf.cast::<u8>());
@@ -1269,16 +1311,40 @@ mod tests {
         assert_eq!(sqe.opcode, sys::Opcode::Timeout);
     }
 
-    /// Direct descriptor slots go on the wire 1-based so that zero can mean
-    /// "not a fixed file", and must read back 0-based.
+    /// A transform composes with what `new` preset and with earlier calls,
+    /// which a plain setter would silently drop.
+    #[test]
+    fn sqe_flags_accumulates() {
+        let op = FixedFdInstall::new()
+            .sqe_flags(|f| f | sys::SqeFlags::IO_LINK)
+            .sqe_flags(|f| f | sys::SqeFlags::SKIP_SUCCESS);
+        assert_eq!(
+            op.get_sqe_flags(),
+            sys::SqeFlags::FIXED_FILE | sys::SqeFlags::IO_LINK | sys::SqeFlags::SKIP_SUCCESS
+        );
+
+        // And it can still clear, which is the whole reason it is a transform
+        // and not an OR.
+        let cleared = op.sqe_flags(|f| f - sys::SqeFlags::IO_LINK);
+        assert_eq!(
+            cleared.get_sqe_flags(),
+            sys::SqeFlags::FIXED_FILE | sys::SqeFlags::SKIP_SUCCESS
+        );
+    }
+
+    /// Output slots go on the wire 1-based so that zero can mean "not a fixed
+    /// file", and must read back 0-based.
     #[test]
     fn slots_are_encoded_one_based() {
         assert_eq!(Openat::new().slot(0).into_sqe().file_index, 1);
         assert_eq!(Openat::new().slot(0).get_slot(), 0);
         assert_eq!(Openat::new().slot(41).into_sqe().file_index, 42);
-        // The allocate sentinel has to survive the round trip untouched.
+        // The allocate sentinel is not an index and must reach the wire
+        // untouched: the kernel tests the raw field against `~0U` before it
+        // subtracts, so an encoded `0` here would ask for a plain descriptor
+        // instead of a slot.
         let alloc = Openat::new().slot(sys::FILE_INDEX_ALLOC);
-        assert_eq!(alloc.into_sqe().file_index, 0, "!0 + 1 wraps to 0");
+        assert_eq!(alloc.into_sqe().file_index, sys::FILE_INDEX_ALLOC);
         assert_eq!(alloc.get_slot(), sys::FILE_INDEX_ALLOC);
     }
 
