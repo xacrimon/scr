@@ -316,7 +316,11 @@ mod tests {
             let idx = tail & sq_mask;
             let sqe = sqes.as_ptr().cast::<sys::Sqe>().add(idx as usize);
             sqe.write({
-                let mut s = sys::Sqe::new(sys::Opcode::Nop);
+                let mut s = sys::Sqe {
+                    opcode: sys::Opcode::Nop,
+                    ..sys::Sqe::ZEROED
+                };
+
                 s.user_data = USER_DATA;
                 s
             });

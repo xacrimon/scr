@@ -176,20 +176,6 @@ impl Sqe {
         addr3: 0,
         addr3_hi: 0,
     };
-
-    /// A zeroed SQE with `opcode` set. Every other field is left for the caller.
-    pub const fn new(opcode: Opcode) -> Sqe {
-        Sqe {
-            opcode,
-            ..Sqe::ZEROED
-        }
-    }
-}
-
-impl Default for Sqe {
-    fn default() -> Sqe {
-        Sqe::ZEROED
-    }
 }
 
 /// A 128-byte submission queue entry.
@@ -216,13 +202,6 @@ impl Sqe128 {
         tail: [0; 64],
     };
 
-    pub const fn new(opcode: Opcode) -> Sqe128 {
-        Sqe128 {
-            sqe: Sqe::new(opcode),
-            tail: [0; 64],
-        }
-    }
-
     /// The 80-byte `cmd[]` payload at offset 48.
     pub fn cmd(&self) -> &[u8; 80] {
         // SAFETY: offset 48 + 80 == 128 == size_of::<Sqe128>(), and [u8; 80]
@@ -244,12 +223,6 @@ impl Sqe128 {
                 .add(48)
                 .cast::<[u8; 80]>()
         }
-    }
-}
-
-impl Default for Sqe128 {
-    fn default() -> Sqe128 {
-        Sqe128::ZEROED
     }
 }
 
