@@ -140,12 +140,6 @@ macro_rules! opcode {
             opcode!(@fields $($fields)*);
         }
 
-        impl Default for $name {
-            fn default() -> $name {
-                $name::new()
-            }
-        }
-
         impl From<$name> for sys::Sqe {
             fn from(op: $name) -> sys::Sqe {
                 op.0
