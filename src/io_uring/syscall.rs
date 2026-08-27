@@ -60,7 +60,7 @@ impl Errno {
         Errno(io::Error::last_os_error().raw_os_error().unwrap_or(0))
     }
 
-    pub const fn raw(self) -> i32 {
+    pub fn raw(self) -> i32 {
         self.0
     }
 }

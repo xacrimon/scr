@@ -87,7 +87,7 @@ macro_rules! opcode {
 
         impl $name {
             /// A zeroed SQE for this operation.
-            pub const fn new() -> $name {
+            pub fn new() -> $name {
                 $name(sys::Sqe {
                     opcode: sys::Opcode::$name,
                     $($init: $iv,)*
@@ -96,12 +96,12 @@ macro_rules! opcode {
             }
 
             /// The completion token echoed back in `cqe.user_data`.
-            pub const fn user_data(mut self, value: u64) -> $name {
+            pub fn user_data(mut self, value: u64) -> $name {
                 self.0.user_data = value;
                 self
             }
 
-            pub const fn get_user_data(&self) -> u64 {
+            pub fn get_user_data(&self) -> u64 {
                 self.0.user_data
             }
 
@@ -109,31 +109,31 @@ macro_rules! opcode {
             ///
             /// Named `sqe_flags` because several operations have a `flags` of
             /// their own that lands in a different field.
-            pub const fn sqe_flags(mut self, value: sys::SqeFlags) -> $name {
+            pub fn sqe_flags(mut self, value: sys::SqeFlags) -> $name {
                 self.0.flags = value;
                 self
             }
 
-            pub const fn get_sqe_flags(&self) -> sys::SqeFlags {
+            pub fn get_sqe_flags(&self) -> sys::SqeFlags {
                 self.0.flags
             }
 
             /// Registered credentials to issue this operation under.
-            pub const fn personality(mut self, value: u16) -> $name {
+            pub fn personality(mut self, value: u16) -> $name {
                 self.0.personality = value;
                 self
             }
 
-            pub const fn get_personality(&self) -> u16 {
+            pub fn get_personality(&self) -> u16 {
                 self.0.personality
             }
 
             /// The encoded submission queue entry.
-            pub const fn into_sqe(self) -> sys::Sqe {
+            pub fn into_sqe(self) -> sys::Sqe {
                 self.0
             }
 
-            pub const fn as_sqe(&self) -> &sys::Sqe {
+            pub fn as_sqe(&self) -> &sys::Sqe {
                 &self.0
             }
 
