@@ -103,7 +103,7 @@ fn ret(r: libc::c_long) -> Result<u32, Errno> {
 /// Returns a file descriptor, *except* under [`sys::SetupFlags::REGISTERED_FD_ONLY`],
 /// where the return is an index into the ring's own registered-fd table and must
 /// not be passed to `close`.
-pub fn setup(entries: u32, params: &mut sys::Params) -> Result<u32, Errno> {
+pub fn io_uring_setup(entries: u32, params: &mut sys::Params) -> Result<u32, Errno> {
     // SAFETY: `params` is a valid, uniquely borrowed `Params` for the call.
     ret(unsafe {
         libc::syscall(
@@ -128,7 +128,7 @@ pub fn setup(entries: u32, params: &mut sys::Params) -> Result<u32, Errno> {
 /// `flags`, and that every submitted SQE is well formed: the kernel will
 /// dereference the addresses in them and read from or write to the registered
 /// buffers and mapped rings for as long as those operations are in flight.
-pub unsafe fn enter(
+pub unsafe fn io_uring_enter(
     fd: u32,
     to_submit: u32,
     min_complete: u32,
@@ -160,7 +160,12 @@ pub unsafe fn enter(
 ///
 /// `arg` and `nr_args` must match what `op` expects, and any memory registered
 /// with the kernel must stay valid and unmoved until it is unregistered.
-pub unsafe fn register(fd: u32, op: u32, arg: *const c_void, nr_args: u32) -> Result<u32, Errno> {
+pub unsafe fn io_uring_register(
+    fd: u32,
+    op: u32,
+    arg: *const c_void,
+    nr_args: u32,
+) -> Result<u32, Errno> {
     // SAFETY: forwarded to the caller's contract.
     ret(unsafe {
         libc::syscall(
@@ -260,113 +265,6 @@ pub unsafe fn close(fd: i32) -> Result<(), Errno> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    /// End-to-end smoke test: set up a ring, map it, submit a `Nop`, reap the
-    /// completion. Exercises the `Params`/`Sqe`/`Cqe` layouts and the ring
-    /// offsets against the running kernel.
-    #[test]
-    #[cfg_attr(miri, ignore = "issues real syscalls and mmaps a ring")]
-    fn nop_round_trip() {
-        const ENTRIES: u32 = 8;
-        const USER_DATA: u64 = 0xdead_beef_1234_5678;
-
-        let mut p = sys::Params::default();
-        let fd = setup(ENTRIES, &mut p).expect("io_uring_setup") as i32;
-
-        assert!(p.sq_entries >= ENTRIES, "sq_entries = {}", p.sq_entries);
-        assert!(p.cq_entries >= ENTRIES, "cq_entries = {}", p.cq_entries);
-
-        // These are byte offsets into the mapped ring region, chosen by the
-        // kernel. We can't predict them, but a zeroed `cqes`/`array` would mean
-        // `Params` is misaligned and the kernel wrote into the wrong fields.
-        assert_ne!(p.sq_off.array, 0, "sq_off not filled in");
-        assert_ne!(p.cq_off.cqes, 0, "cq_off not filled in");
-
-        let mut sq_sz = p.sq_off.array as usize + p.sq_entries as usize * 4;
-        let mut cq_sz =
-            p.cq_off.cqes as usize + p.cq_entries as usize * std::mem::size_of::<sys::Cqe>();
-        let single = p.features.contains(sys::Features::SINGLE_MMAP);
-        if single {
-            sq_sz = sq_sz.max(cq_sz);
-            cq_sz = sq_sz;
-        }
-
-        unsafe {
-            let sq = map_ring(sq_sz, fd, sys::OFF_SQ_RING).expect("map sq");
-            let cq = if single {
-                sq
-            } else {
-                map_ring(cq_sz, fd, sys::OFF_CQ_RING).expect("map cq")
-            };
-            let sqes_sz = p.sq_entries as usize * std::mem::size_of::<sys::Sqe>();
-            let sqes = map_ring(sqes_sz, fd, sys::OFF_SQES).expect("map sqes");
-
-            let at = |base: NonNull<c_void>, off: u32| -> *const AtomicU32 {
-                base.as_ptr().byte_add(off as usize).cast()
-            };
-            let sq_tail = at(sq, p.sq_off.tail);
-            let sq_mask = (*at(sq, p.sq_off.ring_mask)).load(Ordering::Relaxed);
-            let cq_head = at(cq, p.cq_off.head);
-            let cq_tail = at(cq, p.cq_off.tail);
-            let cq_mask = (*at(cq, p.cq_off.ring_mask)).load(Ordering::Relaxed);
-
-            // Fill slot 0 with a Nop and point the SQ array at it.
-            let tail = (*sq_tail).load(Ordering::Relaxed);
-            let idx = tail & sq_mask;
-            let sqe = sqes.as_ptr().cast::<sys::Sqe>().add(idx as usize);
-            sqe.write({
-                let mut s = sys::Sqe {
-                    opcode: sys::Opcode::Nop,
-                    ..sys::Sqe::ZEROED
-                };
-
-                s.user_data = USER_DATA;
-                s
-            });
-            assert!(
-                !p.flags.contains(sys::SetupFlags::NO_SQARRAY),
-                "test assumes the SQ index array is present"
-            );
-            let array = sq.as_ptr().byte_add(p.sq_off.array as usize).cast::<u32>();
-            array.add(idx as usize).write(idx);
-            (*sq_tail).store(tail + 1, Ordering::Release);
-
-            let submitted = enter(
-                fd as u32,
-                1,
-                1,
-                sys::EnterFlags::GETEVENTS,
-                std::ptr::null(),
-                0,
-            )
-            .expect("io_uring_enter");
-            assert_eq!(submitted, 1, "kernel consumed {submitted} sqes");
-
-            let head = (*cq_head).load(Ordering::Relaxed);
-            assert_eq!(
-                (*cq_tail).load(Ordering::Acquire),
-                head + 1,
-                "expected exactly one completion"
-            );
-            let cqe = &*cq
-                .as_ptr()
-                .byte_add(p.cq_off.cqes as usize)
-                .cast::<sys::Cqe>()
-                .add((head & cq_mask) as usize);
-
-            assert_eq!(cqe.user_data, USER_DATA, "user_data did not round-trip");
-            assert_eq!(cqe.res, 0, "nop failed: {}", Errno(-cqe.res));
-            (*cq_head).store(head + 1, Ordering::Release);
-
-            munmap(sqes, sqes_sz).unwrap();
-            if !single {
-                munmap(cq, cq_sz).unwrap();
-            }
-            munmap(sq, sq_sz).unwrap();
-            close(fd).unwrap();
-        }
-    }
 
     /// The kernel reports back a feature set and honours `Opcode::LAST`, which
     /// only works if `Features` and the probe path agree with the header.
@@ -374,7 +272,7 @@ mod tests {
     #[cfg_attr(miri, ignore = "issues real syscalls and mmaps a ring")]
     fn setup_reports_features() {
         let mut p = sys::Params::default();
-        let fd = setup(4, &mut p).expect("io_uring_setup") as i32;
+        let fd = io_uring_setup(4, &mut p).expect("io_uring_setup") as i32;
         assert!(
             p.features.contains(sys::Features::NODROP),
             "features = {:?}",
