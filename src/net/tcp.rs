@@ -15,6 +15,7 @@
 //! connection a descriptor that is still open. Everything that gives a slot back
 //! does so from a completion, which is what [`close_slot`] is for.
 
+#[cfg(debug_assertions)]
 use std::cell::Cell;
 use std::fmt;
 use std::io;

@@ -8,7 +8,7 @@ use slab::Slab;
 
 use crate::runtime::task::{Header, Id, JoinHandle, Runnable, Task, new_task};
 
-const BASE_TASK_CAPACITY: usize = 32;
+const BASE_TASK_CAPACITY: usize = 4096;
 
 pub(crate) struct OwnedTasks {
     inner: UnsafeCell<Inner>,

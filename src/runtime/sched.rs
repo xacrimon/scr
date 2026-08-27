@@ -9,7 +9,7 @@ use std::rc::Rc;
 use crate::runtime::driver::Driver;
 use crate::runtime::task::{Header, JoinHandle, OwnedTasks, Runnable, Task};
 
-const BASE_QUEUE_CAPACITY: usize = 32;
+const BASE_QUEUE_CAPACITY: usize = 1024;
 
 pub(crate) struct Handle {
     queue: Queue,
