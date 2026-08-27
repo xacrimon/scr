@@ -5,6 +5,9 @@ mod io_uring;
 mod runtime;
 mod util;
 
+pub mod buf;
+pub mod io;
+pub mod net;
 pub mod task;
 
 pub use crate::runtime::Runtime;

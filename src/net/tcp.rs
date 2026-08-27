@@ -1,0 +1,614 @@
+//! TCP listeners and streams, over direct descriptors only.
+//!
+//! Neither type ever holds a process file descriptor. A listener is created,
+//! bound and put into listening state entirely inside the ring, landing in a
+//! slot of the registered file table; the connections it accepts are installed
+//! into slots of their own. Nothing here can be passed to `read(2)`, and that is
+//! the point — every operation is an array index into the ring's own table
+//! rather than a lookup in the process file table.
+//!
+//! # Slot lifetime
+//!
+//! A slot is reserved before the operation that fills it is submitted, and
+//! returned only when the operation that empties it *completes*. Closing is
+//! asynchronous, so returning a slot at submission time would hand the next
+//! connection a descriptor that is still open. Everything that gives a slot back
+//! does so from a completion, which is what [`close_slot`] is for.
+
+use std::cell::Cell;
+use std::io;
+use std::net::SocketAddr;
+use std::ptr::NonNull;
+use std::rc::Rc;
+
+use crate::buf::{BufResult, IoBuf, IoBufMut};
+use crate::io::{AsyncRead, AsyncWrite};
+use crate::io_uring::{op, sys};
+use crate::runtime::context;
+use crate::runtime::driver::Driver;
+use crate::runtime::driver::ledger::OnComplete;
+use crate::runtime::driver::op::{Chain, ChainCompletable, Completable, Op};
+
+use super::addr::SockAddr;
+
+/// Connections the kernel may queue before we accept them.
+const BACKLOG: u32 = 1024;
+
+// ---------------------------------------------------------------------------
+// Slots
+// ---------------------------------------------------------------------------
+
+/// Empty a direct descriptor slot, returning it to the table once that lands.
+///
+/// Safe to call on a slot that was never filled: the close fails with `EBADF`
+/// and the slot comes back regardless, which is what lets the cleanup paths be
+/// unconditional instead of having to work out how far a chain got.
+fn close_slot(driver: &Driver, slot: u32) {
+    let sqe = op::Close::new().slot(slot).into_sqe();
+    driver.submit_detached(sqe, Box::new(FreeSlot(slot)));
+}
+
+/// Returns a slot to the table when the close that emptied it completes.
+struct FreeSlot(u32);
+
+impl OnComplete for FreeSlot {
+    fn on_complete(self: Box<Self>, driver: &Driver, _res: i32, _flags: sys::CqeFlags) {
+        driver.free_slot(self.0);
+    }
+}
+
+/// Turn a completion's `res` into a result.
+fn result(res: i32) -> io::Result<u32> {
+    if res < 0 {
+        Err(io::Error::from_raw_os_error(-res))
+    } else {
+        Ok(res as u32)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Listener
+// ---------------------------------------------------------------------------
+
+/// A TCP socket listening for connections, held as a direct descriptor.
+pub struct TcpListener {
+    driver: Rc<Driver>,
+    slot: u32,
+}
+
+impl TcpListener {
+    /// Create a socket, bind it to `addr`, and start listening.
+    ///
+    /// All three run as one linked chain, so the whole thing costs a single
+    /// submission rather than three round trips. That is only possible because
+    /// the slot is chosen up front: the bind and the listen can name the
+    /// descriptor the socket operation has not made yet.
+    pub async fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
+        let driver = context::driver();
+        let slot = driver
+            .alloc_slot()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENFILE))?;
+
+        let mut sock_addr = SockAddr::from_socket_addr(addr);
+        let addr_ptr = sock_addr.addr_ptr();
+        let addr_len = sock_addr.len();
+
+        let chain = [
+            // The socket operation's `fd` field holds the address family, not a
+            // descriptor, and its slot is an output — so no `FIXED_FILE` here,
+            // unlike the two that follow.
+            op::Socket::new()
+                .domain(SockAddr::domain(addr))
+                .kind(libc::SOCK_STREAM as u64)
+                .protocol(0)
+                .slot(slot)
+                .sqe_flags(|f| f | sys::SqeFlags::IO_LINK)
+                .into_sqe(),
+            op::Bind::new()
+                .fd(slot as i32)
+                .addr(addr_ptr)
+                .addrlen(addr_len)
+                .sqe_flags(|f| f | sys::SqeFlags::FIXED_FILE | sys::SqeFlags::IO_LINK)
+                .into_sqe(),
+            op::Listen::new()
+                .fd(slot as i32)
+                .backlog(BACKLOG)
+                .sqe_flags(|f| f | sys::SqeFlags::FIXED_FILE)
+                .into_sqe(),
+        ];
+
+        let data = BindChain {
+            driver: Rc::clone(&driver),
+            slot,
+            _addr: sock_addr,
+        };
+
+        Chain::submit(&driver, chain, data).await
+    }
+
+    /// Accept one connection.
+    pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        let slot = self
+            .driver
+            .alloc_slot()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENFILE))?;
+
+        let mut peer = SockAddr::zeroed();
+        let sqe = op::Accept::new()
+            .fd(self.slot as i32)
+            .sqe_flags(|f| f | sys::SqeFlags::FIXED_FILE)
+            .peer(Some(peer.ptrs()))
+            .slot(slot)
+            .into_sqe();
+
+        let data = AcceptOp {
+            driver: Rc::clone(&self.driver),
+            slot,
+            peer,
+        };
+
+        Op::submit(&self.driver, sqe, data).await
+    }
+
+    /// The registered file table slot this listener occupies.
+    pub fn slot(&self) -> u32 {
+        self.slot
+    }
+}
+
+impl Drop for TcpListener {
+    fn drop(&mut self) {
+        self.driver.cancel_slot(self.slot);
+        close_slot(&self.driver, self.slot);
+    }
+}
+
+/// The payload of the socket/bind/listen chain.
+struct BindChain {
+    driver: Rc<Driver>,
+    slot: u32,
+    /// Held only so the kernel's pointer to it stays valid for the whole chain.
+    _addr: Box<SockAddr>,
+}
+
+impl ChainCompletable<3> for BindChain {
+    type Output = io::Result<TcpListener>;
+
+    fn complete(self, _driver: &Driver, res: [i32; 3]) -> io::Result<TcpListener> {
+        // Once a member fails the rest report `ECANCELED`, so the first error is
+        // the one worth reporting.
+        if let Some(&failed) = res.iter().find(|&&r| r < 0) {
+            close_slot(&self.driver, self.slot);
+            return Err(io::Error::from_raw_os_error(-failed));
+        }
+
+        Ok(TcpListener {
+            driver: Rc::clone(&self.driver),
+            slot: self.slot,
+        })
+    }
+
+    fn cleanup(self, driver: &Driver) {
+        // The chain may have got as far as creating the socket, and there is now
+        // nobody to close it; closing an empty slot is harmless.
+        close_slot(driver, self.slot);
+    }
+}
+
+/// The payload of an accept.
+struct AcceptOp {
+    driver: Rc<Driver>,
+    slot: u32,
+    peer: Box<SockAddr>,
+}
+
+impl Completable for AcceptOp {
+    type Output = io::Result<(TcpStream, SocketAddr)>;
+
+    fn complete(self, _driver: &Driver, res: i32, _flags: sys::CqeFlags) -> Self::Output {
+        // With a slot named, a successful accept reports zero rather than a
+        // descriptor — the connection is already in the table.
+        if let Err(e) = result(res) {
+            self.driver.free_slot(self.slot);
+            return Err(e);
+        }
+
+        match self.peer.to_socket_addr() {
+            Ok(addr) => Ok((TcpStream::new(Rc::clone(&self.driver), self.slot), addr)),
+            Err(e) => {
+                // A connection we cannot describe is still a connection.
+                close_slot(&self.driver, self.slot);
+                Err(e)
+            }
+        }
+    }
+
+    fn cleanup(self, driver: &Driver, res: i32, _flags: sys::CqeFlags) {
+        if res < 0 {
+            driver.free_slot(self.slot);
+        } else {
+            // It succeeded after the caller stopped caring. Without this the
+            // connection stays open in a slot no handle names.
+            close_slot(driver, self.slot);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stream
+// ---------------------------------------------------------------------------
+
+/// A TCP connection, held as a direct descriptor.
+///
+/// Reads and writes take `&self`, so two tasks sharing an `Rc<TcpStream>` can
+/// run one of each at the same time without splitting it. Two concurrent reads,
+/// or two concurrent writes, are a bug, and are caught by a debug assertion.
+pub struct TcpStream {
+    driver: Rc<Driver>,
+    slot: u32,
+    #[cfg(debug_assertions)]
+    reading: Cell<bool>,
+    #[cfg(debug_assertions)]
+    writing: Cell<bool>,
+}
+
+impl TcpStream {
+    fn new(driver: Rc<Driver>, slot: u32) -> TcpStream {
+        TcpStream {
+            driver,
+            slot,
+            #[cfg(debug_assertions)]
+            reading: Cell::new(false),
+            #[cfg(debug_assertions)]
+            writing: Cell::new(false),
+        }
+    }
+
+    /// The registered file table slot this connection occupies.
+    pub fn slot(&self) -> u32 {
+        self.slot
+    }
+
+    #[cfg(debug_assertions)]
+    fn claim_read(&self) -> Busy<'_> {
+        Busy::claim(&self.reading, "reads")
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn claim_read(&self) {}
+
+    #[cfg(debug_assertions)]
+    fn claim_write(&self) -> Busy<'_> {
+        Busy::claim(&self.writing, "writes")
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn claim_write(&self) {}
+}
+
+impl AsyncRead for TcpStream {
+    async fn read<B: IoBufMut>(&self, mut buf: B) -> BufResult<usize, B> {
+        let _busy = self.claim_read();
+
+        let ptr = NonNull::new(buf.write_ptr()).expect("a buffer address is never null");
+        let window = NonNull::slice_from_raw_parts(ptr, buf.bytes_total());
+
+        let sqe = op::Recv::new()
+            .fd(self.slot as i32)
+            .sqe_flags(|f| f | sys::SqeFlags::FIXED_FILE)
+            .buf(window)
+            .into_sqe();
+
+        Op::submit(&self.driver, sqe, Recv { buf }).await
+    }
+}
+
+impl AsyncWrite for TcpStream {
+    async fn write<B: IoBuf>(&self, buf: B) -> BufResult<usize, B> {
+        let _busy = self.claim_write();
+
+        let ptr = NonNull::new(buf.read_ptr().cast_mut()).expect("a buffer address is never null");
+        let window = NonNull::slice_from_raw_parts(ptr, buf.bytes_init());
+
+        let sqe = op::Send::new()
+            .fd(self.slot as i32)
+            .sqe_flags(|f| f | sys::SqeFlags::FIXED_FILE)
+            .buf(window)
+            .into_sqe();
+
+        Op::submit(&self.driver, sqe, Send { buf }).await
+    }
+
+    async fn shutdown(&self) -> io::Result<()> {
+        let sqe = op::Shutdown::new()
+            .fd(self.slot as i32)
+            .sqe_flags(|f| f | sys::SqeFlags::FIXED_FILE)
+            .how(libc::SHUT_WR as u32)
+            .into_sqe();
+
+        Op::submit(&self.driver, sqe, Shutdown).await
+    }
+}
+
+impl Drop for TcpStream {
+    fn drop(&mut self) {
+        // One entry stops everything still running on this slot; without it a
+        // read on an idle connection would hold its ledger entry, and the buffer
+        // in it, until the peer happened to send something.
+        self.driver.cancel_slot(self.slot);
+        close_slot(&self.driver, self.slot);
+    }
+}
+
+/// Guards against two reads, or two writes, running on one stream at once.
+///
+/// This is the bug `&mut self` on the IO traits would have made impossible, and
+/// the reason giving it up is affordable: it is caught here in debug builds,
+/// costs nothing in release, and — unlike the borrow checker — it keeps working
+/// once the stream is shared between tasks, which is when it can actually
+/// happen.
+#[cfg(debug_assertions)]
+struct Busy<'a> {
+    flag: &'a Cell<bool>,
+}
+
+#[cfg(debug_assertions)]
+impl<'a> Busy<'a> {
+    fn claim(flag: &'a Cell<bool>, what: &str) -> Busy<'a> {
+        assert!(
+            !flag.replace(true),
+            "two concurrent {what} on one TcpStream; they would race for the same bytes"
+        );
+        Busy { flag }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.flag.set(false);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stream operations
+// ---------------------------------------------------------------------------
+
+struct Recv<B: IoBufMut> {
+    buf: B,
+}
+
+impl<B: IoBufMut> Completable for Recv<B> {
+    type Output = BufResult<usize, B>;
+
+    fn complete(mut self, _driver: &Driver, res: i32, _flags: sys::CqeFlags) -> Self::Output {
+        match result(res) {
+            Err(e) => (Err(e), self.buf),
+            Ok(n) => {
+                // SAFETY: the kernel reports what it wrote, and it was given a
+                // window of exactly `bytes_total`.
+                unsafe { self.buf.set_init(n as usize) };
+                (Ok(n as usize), self.buf)
+            }
+        }
+    }
+
+    fn cleanup(self, _driver: &Driver, _res: i32, _flags: sys::CqeFlags) {
+        // Holding the buffer until now was the whole job; dropping it here is
+        // the first moment the kernel is provably finished with it.
+    }
+}
+
+struct Send<B: IoBuf> {
+    buf: B,
+}
+
+impl<B: IoBuf> Completable for Send<B> {
+    type Output = BufResult<usize, B>;
+
+    fn complete(self, _driver: &Driver, res: i32, _flags: sys::CqeFlags) -> Self::Output {
+        match result(res) {
+            Err(e) => (Err(e), self.buf),
+            Ok(n) => (Ok(n as usize), self.buf),
+        }
+    }
+
+    fn cleanup(self, _driver: &Driver, _res: i32, _flags: sys::CqeFlags) {}
+}
+
+struct Shutdown;
+
+impl Completable for Shutdown {
+    type Output = io::Result<()>;
+
+    fn complete(self, _driver: &Driver, res: i32, _flags: sys::CqeFlags) -> io::Result<()> {
+        result(res).map(|_| ())
+    }
+
+    fn cleanup(self, _driver: &Driver, _res: i32, _flags: sys::CqeFlags) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpStream as StdStream;
+    use std::task::{ContextBuilder, Poll, Waker};
+    use std::thread;
+
+    use crate::Runtime;
+    use crate::runtime::driver::noop_local_waker;
+
+    /// An address nothing is listening on, borrowed from the OS and handed
+    /// straight back. A listener that never accepted leaves no `TIME_WAIT`
+    /// behind, so the port really is free again.
+    fn free_addr() -> SocketAddr {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
+        probe.local_addr().expect("local_addr")
+    }
+
+    /// Turn the reactor until `done` holds. Each `yield_now` costs the executor
+    /// one pass, and a pass is one `io_uring_enter`.
+    async fn settle(mut done: impl FnMut() -> bool) {
+        for _ in 0..1000 {
+            if done() {
+                return;
+            }
+            crate::task::yield_now().await;
+        }
+        panic!("the driver never settled");
+    }
+
+    #[test]
+    fn a_connection_arrives_with_its_peer_address() {
+        let rt = Runtime::new().expect("Runtime::new");
+        let addr = free_addr();
+
+        rt.block_on(async move {
+            let listener = TcpListener::bind(addr).await.expect("bind");
+
+            let client = thread::spawn(move || {
+                let mut sock = StdStream::connect(addr).expect("connect");
+                sock.write_all(b"hello").expect("write");
+                sock.local_addr().expect("local_addr")
+            });
+
+            let (stream, peer) = listener.accept().await.expect("accept");
+            let (n, buf) = stream.read(vec![0u8; 16]).await;
+
+            assert_eq!(n.expect("read"), 5);
+            assert_eq!(&buf[..5], b"hello");
+            assert_eq!(peer, client.join().expect("client thread"));
+        });
+    }
+
+    #[test]
+    fn a_stream_writes_back() {
+        let rt = Runtime::new().expect("Runtime::new");
+        let addr = free_addr();
+
+        rt.block_on(async move {
+            let listener = TcpListener::bind(addr).await.expect("bind");
+
+            let client = thread::spawn(move || {
+                let mut sock = StdStream::connect(addr).expect("connect");
+                sock.write_all(b"ping").expect("write");
+                let mut got = [0u8; 4];
+                sock.read_exact(&mut got).expect("read");
+                got
+            });
+
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (n, buf) = stream.read(vec![0u8; 16]).await;
+            assert_eq!(n.expect("read"), 4);
+
+            let (written, _) = stream.write(b"pong".to_vec()).await;
+            assert_eq!(written.expect("write"), 4);
+            drop(buf);
+
+            assert_eq!(&client.join().expect("client thread"), b"pong");
+        });
+    }
+
+    #[test]
+    fn a_read_past_the_peers_close_reports_end_of_file() {
+        let rt = Runtime::new().expect("Runtime::new");
+        let addr = free_addr();
+
+        rt.block_on(async move {
+            let listener = TcpListener::bind(addr).await.expect("bind");
+            let client = thread::spawn(move || drop(StdStream::connect(addr).expect("connect")));
+
+            let (stream, _) = listener.accept().await.expect("accept");
+            client.join().expect("client thread");
+
+            let (n, _) = stream.read(vec![0u8; 16]).await;
+            assert_eq!(n.expect("read"), 0, "a clean close reads as zero bytes");
+        });
+    }
+
+    /// Appending rather than overwriting, which is what an open-ended slice is
+    /// for — and the thing most likely to be got wrong at a call site.
+    #[test]
+    fn reading_into_a_slice_appends() {
+        let rt = Runtime::new().expect("Runtime::new");
+        let addr = free_addr();
+
+        rt.block_on(async move {
+            let listener = TcpListener::bind(addr).await.expect("bind");
+            let client = thread::spawn(move || {
+                let mut sock = StdStream::connect(addr).expect("connect");
+                sock.write_all(b"world").expect("write");
+            });
+
+            let (stream, _) = listener.accept().await.expect("accept");
+
+            let mut buf = Vec::with_capacity(32);
+            buf.extend_from_slice(b"hello ");
+
+            let (n, slice) = stream.read(buf.slice(6..)).await;
+            assert_eq!(n.expect("read"), 5);
+            assert_eq!(slice.into_inner(), b"hello world");
+
+            client.join().expect("client thread");
+        });
+    }
+
+    #[test]
+    fn dropping_a_stream_returns_its_slot() {
+        let rt = Runtime::new().expect("Runtime::new");
+        let addr = free_addr();
+
+        rt.block_on(async move {
+            let listener = TcpListener::bind(addr).await.expect("bind");
+            let driver = context::driver();
+            let before = driver.slots_used();
+
+            let client = thread::spawn(move || StdStream::connect(addr).expect("connect"));
+            let (stream, _) = listener.accept().await.expect("accept");
+            assert_eq!(driver.slots_used(), before + 1, "the connection took one");
+
+            drop(stream);
+            settle(|| driver.slots_used() == before).await;
+
+            drop(client.join().expect("client thread"));
+        });
+    }
+
+    /// The trap [`Completable::cleanup`] exists for. An accept that succeeds
+    /// after its future is gone has produced a connection in a slot that no
+    /// handle names; unless the cleanup closes it, both are lost for good.
+    #[test]
+    fn an_abandoned_accept_returns_its_slot() {
+        let rt = Runtime::new().expect("Runtime::new");
+        let addr = free_addr();
+
+        rt.block_on(async move {
+            let listener = TcpListener::bind(addr).await.expect("bind");
+            let driver = context::driver();
+            let before = driver.slots_used();
+
+            let local = noop_local_waker();
+            let mut cx = ContextBuilder::from_waker(Waker::noop())
+                .local_waker(&local)
+                .build();
+
+            // Poll once so the accept is actually submitted and holds a slot,
+            // then walk away from it. `Box::pin` rather than `pin!` because this
+            // has to own the future: dropping a `Pin<&mut F>` drops the pointer
+            // and leaves the operation running.
+            let mut accept = Box::pin(listener.accept());
+            assert!(matches!(accept.as_mut().poll(&mut cx), Poll::Pending));
+            assert_eq!(driver.slots_used(), before + 1, "it reserved a slot");
+            drop(accept);
+
+            // Race a connection against the cancellation: whichever wins, the
+            // slot has to come back.
+            let client = thread::spawn(move || StdStream::connect(addr).ok());
+
+            settle(|| driver.slots_used() == before).await;
+            drop(client.join().expect("client thread"));
+        });
+    }
+}

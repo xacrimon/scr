@@ -139,7 +139,28 @@ impl Ring {
 
         // Matches `io_uring_mmap`: the SQ index array sits at the tail of the
         // SQ region, and the CQE array at the tail of the CQ region.
-        let mut sq_sz = params.sq_off.array as usize + params.sq_entries as usize * 4;
+        //
+        // Under `NO_SQARRAY` there is no index array and the kernel reports
+        // `array = 0`, so that formula would size the SQ region at nothing.
+        // Fall back to the header itself: the highest control word the kernel
+        // placed, plus its own width.
+        let off = &params.sq_off;
+        let mut sq_sz = if params.flags.contains(sys::SetupFlags::NO_SQARRAY) {
+            let last = [
+                off.head,
+                off.tail,
+                off.ring_mask,
+                off.ring_entries,
+                off.flags,
+                off.dropped,
+            ]
+            .into_iter()
+            .max()
+            .expect("the array is not empty");
+            last as usize + size_of::<u32>()
+        } else {
+            off.array as usize + params.sq_entries as usize * 4
+        };
         let mut cq_sz = params.cq_off.cqes as usize
             + ((params.cq_entries as usize * size_of::<sys::Cqe>()) << cqe_shift);
         let single = params.features.contains(sys::Features::SINGLE_MMAP);
@@ -232,6 +253,16 @@ impl Ring {
     ///
     /// Both live in the *submission* ring's flags even though they describe the
     /// completion side. An empty [`CqRing`] with this set is not an idle ring.
+    ///
+    /// # This is not a test for "are there completions"
+    ///
+    /// [`sys::SqRingFlags::TASKRUN`] is only ever raised by the kernel's
+    /// *normal* task-work path, under [`sys::SetupFlags::TASKRUN_FLAG`]. A ring
+    /// created with [`sys::SetupFlags::DEFER_TASKRUN`] takes the local path
+    /// instead and never sets it, so this reports overflow alone and a `false`
+    /// says nothing about work waiting to be run. There is no cheap userspace
+    /// test in that mode: completions become visible only inside an
+    /// `io_uring_enter` carrying [`sys::EnterFlags::GETEVENTS`].
     pub fn needs_flush(&self) -> bool {
         self.sq
             .flags()

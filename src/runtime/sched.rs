@@ -1,9 +1,12 @@
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
+use std::io;
 use std::marker::PhantomData;
 use std::panic::Location;
 use std::ptr::NonNull;
+use std::rc::Rc;
 
+use crate::runtime::driver::Driver;
 use crate::runtime::task::{Header, JoinHandle, OwnedTasks, Runnable, Task};
 
 const BASE_QUEUE_CAPACITY: usize = 32;
@@ -11,14 +14,26 @@ const BASE_QUEUE_CAPACITY: usize = 32;
 pub(crate) struct Handle {
     queue: Queue,
     owned: OwnedTasks,
+    /// Shared with every socket, which needs it in its own `Drop` — after the
+    /// runtime may already have gone.
+    driver: Rc<Driver>,
 }
 
 impl Handle {
-    pub(crate) fn new() -> Handle {
-        Handle {
+    pub(crate) fn new() -> io::Result<Handle> {
+        Ok(Handle {
             queue: Queue::new(),
             owned: OwnedTasks::new(),
-        }
+            driver: Rc::new(Driver::new()?),
+        })
+    }
+
+    pub(crate) fn driver(&self) -> &Rc<Driver> {
+        &self.driver
+    }
+
+    pub(crate) fn queue_is_empty(&self) -> bool {
+        self.queue.is_empty()
     }
 
     pub(crate) fn spawn<F>(&self, future: F, spawned_at: &'static Location<'static>) -> JoinHandle
@@ -59,6 +74,11 @@ impl Handle {
                 drop(runnable);
             }
         }
+
+        // Only now that every future — and so every socket and every operation
+        // future — has been dropped, because dropping them is what hands their
+        // buffers to the driver to hold.
+        self.driver.shutdown();
     }
 }
 
@@ -104,7 +124,7 @@ mod tests {
             }
         }
 
-        let handle = Handle::new();
+        let handle = Handle::new().expect("Handle::new");
         handle.owned.close_and_shutdown_all();
         assert!(handle.owned.is_closed());
 

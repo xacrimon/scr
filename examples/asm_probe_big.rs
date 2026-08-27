@@ -54,7 +54,7 @@ impl Future for BigDropFuture {
 }
 
 fn main() {
-    let rt = Runtime::new();
+    let rt = Runtime::new().expect("Runtime::new");
 
     let a = rt.block_on(async {
         scr::task::spawn(BigFuture {

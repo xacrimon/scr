@@ -1,7 +1,9 @@
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
+use std::rc::Rc;
 
+use crate::runtime::driver::Driver;
 use crate::runtime::sched::Handle;
 use crate::runtime::task::Id;
 
@@ -43,6 +45,20 @@ pub(crate) fn with_handle<R>(f: impl FnOnce(&Handle) -> R) -> R {
     // Safety: the pointer was installed by `enter`, whose guard borrows the
     // runtime it points at and is still alive.
     f(unsafe { handle.as_ref() })
+}
+
+/// The io_uring driver of the runtime the current thread is entered into.
+///
+/// Handed out by `Rc` rather than by reference because a socket outlives the
+/// call that made it and has to reach the driver from its own `Drop`, which may
+/// run when no runtime is entered at all.
+///
+/// # Panics
+///
+/// Panics if the current thread is not inside a runtime.
+#[track_caller]
+pub(crate) fn driver() -> Rc<Driver> {
+    with_handle(|handle| Rc::clone(handle.driver()))
 }
 
 /// Enters `handle` until the returned guard is dropped, so that spawning and

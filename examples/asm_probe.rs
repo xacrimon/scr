@@ -29,7 +29,7 @@ impl Future for DummyFuture {
 }
 
 fn main() {
-    let rt = Runtime::new();
+    let rt = Runtime::new().expect("Runtime::new");
     let out = rt.block_on(async {
         let h = scr::task::spawn(DummyFuture { polled: false });
         h.await
