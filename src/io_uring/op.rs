@@ -1177,6 +1177,17 @@ opcode! {
     optval: u64 => addr3;
     /// Size of `optval`.
     optlen: u32 => file_index;
+    /// Where `SOCKET_URING_OP_GETSOCKNAME` writes the address. Shares a word
+    /// with [`UringCmd::sockopt`]; set only one.
+    sockname: NonNull<c_void> => addr = ptr_enc; <= |s: &sys::Sqe| ptr_dec(s.addr);
+    /// In/out length for [`UringCmd::sockname`]: the buffer's capacity going in,
+    /// the address's true length coming back — which is the larger of the two if
+    /// the address did not fit. Shares a word with [`UringCmd::optval`]; set only
+    /// one.
+    socknamelen: NonNull<u32> => addr3 = ptr_enc; <= |s: &sys::Sqe| ptr_dec(s.addr3);
+    /// Whose address `SOCKET_URING_OP_GETSOCKNAME` reports: 0 for this socket's,
+    /// 1 for the peer's. Shares a word with [`UringCmd::optlen`]; set only one.
+    peer: u32 => file_index;
     flags: sys::UringCmdFlags => op_flags = |v: sys::UringCmdFlags| v.bits();
         <= |s: &sys::Sqe| sys::UringCmdFlags::from_bits_retain(s.op_flags);
 }
@@ -1508,6 +1519,36 @@ mod tests {
         let c = UringCmd::new().sockopt((1, 2));
         assert_eq!(c.get_sockopt(), (1, 2));
         assert_eq!(c.as_sqe().addr, 1 | (2u64 << 32));
+    }
+
+    /// The `GETSOCKNAME` fields land where the kernel reads them, and none of
+    /// the words it insists are zero — `ioprio`, the high half of the `cmd_op`
+    /// word, `len`, `rw_flags` — get written on the way.
+    #[test]
+    fn uring_cmd_lays_out_a_getsockname() {
+        let mut storage = [0u8; 128];
+        let mut len = 128u32;
+        let name = NonNull::new(storage.as_mut_ptr()).unwrap().cast::<c_void>();
+        let namelen = NonNull::new(&raw mut len).unwrap();
+
+        let sqe = UringCmd::new()
+            .fd(3)
+            .cmd_op(sys::SocketOp::Getsockname as u32)
+            .sockname(name)
+            .socknamelen(namelen)
+            .peer(1)
+            .into_sqe();
+
+        assert_eq!(sqe.addr, name.as_ptr() as u64, "the address buffer");
+        assert_eq!(sqe.addr3, namelen.as_ptr() as u64, "the in/out length");
+        assert_eq!(sqe.file_index, 1, "1 asks for the peer's address");
+        assert_eq!(sqe.addr2, sys::SocketOp::Getsockname as u64);
+        assert_eq!(
+            sqe.addr2 >> 32,
+            0,
+            "__pad1 shares this word and must stay 0"
+        );
+        assert_eq!((sqe.ioprio, sqe.len, sqe.op_flags), (0, 0, 0));
     }
 
     /// `buf` writes the address and the length; `nbytes` then narrows the

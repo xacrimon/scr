@@ -58,6 +58,50 @@ impl OnComplete for FreeSlot {
     }
 }
 
+/// Ask the kernel for one end's address, as `getsockname` or `getpeername`.
+///
+/// There is no plain opcode for this; it is a socket passthrough command, which
+/// is why it takes a `cmd_op` rather than an operation of its own.
+async fn sock_name(driver: &Driver, slot: u32, peer: bool) -> io::Result<SocketAddr> {
+    let mut addr = SockAddr::zeroed();
+    // Going in this is the capacity; the kernel overwrites it with the real
+    // length. A `sockaddr_storage` is the largest address there is, so the
+    // truncation this protocol allows for cannot happen here.
+    let (name, namelen) = addr.ptrs();
+
+    let sqe = op::UringCmd::new()
+        .fd(slot as i32)
+        .sqe_flags(|f| f | sys::SqeFlags::FIXED_FILE)
+        .cmd_op(sys::SocketOp::Getsockname as u32)
+        .sockname(name)
+        .socknamelen(namelen)
+        .peer(peer as u32)
+        .into_sqe();
+
+    Op::submit(driver, sqe, GetName { addr }).await
+}
+
+/// The payload of a [`sock_name`] command.
+struct GetName {
+    addr: Box<SockAddr>,
+}
+
+impl Completable for GetName {
+    type Output = io::Result<SocketAddr>;
+
+    fn complete(self, _driver: &Driver, res: i32, _flags: sys::CqeFlags) -> io::Result<SocketAddr> {
+        // Unlike most operations this reports success as a plain zero; the
+        // address came back through the buffer.
+        result(res)?;
+        self.addr.to_socket_addr()
+    }
+
+    fn cleanup(self, _driver: &Driver, _res: i32, _flags: sys::CqeFlags) {
+        // The address buffer outlived the kernel's pointer to it, which was the
+        // only thing that had to happen.
+    }
+}
+
 /// Turn a completion's `res` into a result.
 fn result(res: i32) -> io::Result<u32> {
     if res < 0 {
@@ -149,6 +193,15 @@ impl TcpListener {
         };
 
         Op::submit(&self.driver, sqe, data).await
+    }
+
+    /// The address this listener is bound to.
+    ///
+    /// Worth asking for even when the bind address was fully specified: binding
+    /// to port 0 is how you let the kernel choose one, and this is the only way
+    /// to find out which.
+    pub async fn local_addr(&self) -> io::Result<SocketAddr> {
+        sock_name(&self.driver, self.slot, false).await
     }
 
     /// The registered file table slot this listener occupies.
@@ -316,6 +369,16 @@ impl TcpStream {
             #[cfg(debug_assertions)]
             writing: Cell::new(false),
         }
+    }
+
+    /// This end's address.
+    pub async fn local_addr(&self) -> io::Result<SocketAddr> {
+        sock_name(&self.driver, self.slot, false).await
+    }
+
+    /// The address of the far end.
+    pub async fn peer_addr(&self) -> io::Result<SocketAddr> {
+        sock_name(&self.driver, self.slot, true).await
     }
 
     /// The registered file table slot this connection occupies.
@@ -532,9 +595,17 @@ mod tests {
     use crate::Runtime;
     use crate::runtime::driver::noop_local_waker;
 
+    /// Loopback, port unspecified — the kernel picks one and `local_addr`
+    /// reports it, which is how every test here gets an address nobody else can
+    /// take out from under it.
+    fn any() -> SocketAddr {
+        "127.0.0.1:0".parse().expect("a literal address")
+    }
+
     /// An address nothing is listening on, borrowed from the OS and handed
     /// straight back. A listener that never accepted leaves no `TIME_WAIT`
-    /// behind, so the port really is free again.
+    /// behind, so the port really is free again. Only a test that needs a
+    /// *closed* port wants this; everything else binds to zero and asks.
     fn free_addr() -> SocketAddr {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
         probe.local_addr().expect("local_addr")
@@ -555,10 +626,10 @@ mod tests {
     #[test]
     fn a_connection_arrives_with_its_peer_address() {
         let rt = Runtime::new().expect("Runtime::new");
-        let addr = free_addr();
 
         rt.block_on(async move {
-            let listener = TcpListener::bind(addr).await.expect("bind");
+            let listener = TcpListener::bind(any()).await.expect("bind");
+            let addr = listener.local_addr().await.expect("local_addr");
 
             let client = thread::spawn(move || {
                 let mut sock = StdStream::connect(addr).expect("connect");
@@ -578,10 +649,10 @@ mod tests {
     #[test]
     fn a_stream_writes_back() {
         let rt = Runtime::new().expect("Runtime::new");
-        let addr = free_addr();
 
         rt.block_on(async move {
-            let listener = TcpListener::bind(addr).await.expect("bind");
+            let listener = TcpListener::bind(any()).await.expect("bind");
+            let addr = listener.local_addr().await.expect("local_addr");
 
             let client = thread::spawn(move || {
                 let mut sock = StdStream::connect(addr).expect("connect");
@@ -606,10 +677,10 @@ mod tests {
     #[test]
     fn a_read_past_the_peers_close_reports_end_of_file() {
         let rt = Runtime::new().expect("Runtime::new");
-        let addr = free_addr();
 
         rt.block_on(async move {
-            let listener = TcpListener::bind(addr).await.expect("bind");
+            let listener = TcpListener::bind(any()).await.expect("bind");
+            let addr = listener.local_addr().await.expect("local_addr");
             let client = thread::spawn(move || drop(StdStream::connect(addr).expect("connect")));
 
             let (stream, _) = listener.accept().await.expect("accept");
@@ -625,10 +696,10 @@ mod tests {
     #[test]
     fn reading_into_a_slice_appends() {
         let rt = Runtime::new().expect("Runtime::new");
-        let addr = free_addr();
 
         rt.block_on(async move {
-            let listener = TcpListener::bind(addr).await.expect("bind");
+            let listener = TcpListener::bind(any()).await.expect("bind");
+            let addr = listener.local_addr().await.expect("local_addr");
             let client = thread::spawn(move || {
                 let mut sock = StdStream::connect(addr).expect("connect");
                 sock.write_all(b"world").expect("write");
@@ -650,10 +721,10 @@ mod tests {
     #[test]
     fn dropping_a_stream_returns_its_slot() {
         let rt = Runtime::new().expect("Runtime::new");
-        let addr = free_addr();
 
         rt.block_on(async move {
-            let listener = TcpListener::bind(addr).await.expect("bind");
+            let listener = TcpListener::bind(any()).await.expect("bind");
+            let addr = listener.local_addr().await.expect("local_addr");
             let driver = context::driver();
             let before = driver.slots_used();
 
@@ -674,10 +745,10 @@ mod tests {
     #[test]
     fn an_abandoned_accept_returns_its_slot() {
         let rt = Runtime::new().expect("Runtime::new");
-        let addr = free_addr();
 
         rt.block_on(async move {
-            let listener = TcpListener::bind(addr).await.expect("bind");
+            let listener = TcpListener::bind(any()).await.expect("bind");
+            let addr = listener.local_addr().await.expect("local_addr");
             let driver = context::driver();
             let before = driver.slots_used();
 
@@ -704,6 +775,24 @@ mod tests {
         });
     }
 
+    /// The whole point of `local_addr`: bind to port 0 and find out what the
+    /// kernel picked. This is also the first check that the socket passthrough
+    /// command works at all, and works on a direct descriptor.
+    #[test]
+    fn a_listener_reports_the_port_the_kernel_chose() {
+        let rt = Runtime::new().expect("Runtime::new");
+
+        rt.block_on(async move {
+            let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .expect("bind");
+            let bound = listener.local_addr().await.expect("local_addr");
+
+            assert_eq!(bound.ip(), "127.0.0.1".parse::<std::net::IpAddr>().unwrap());
+            assert_ne!(bound.port(), 0, "the kernel chose a real port");
+        });
+    }
+
     /// Both ends inside the runtime, with no `std::net` anywhere. The connect
     /// resolves before anyone accepts because the kernel finishes the handshake
     /// out of the listen backlog, which is what lets a single-threaded test
@@ -711,10 +800,10 @@ mod tests {
     #[test]
     fn a_connection_made_and_accepted_carries_bytes_both_ways() {
         let rt = Runtime::new().expect("Runtime::new");
-        let addr = free_addr();
 
         rt.block_on(async move {
-            let listener = TcpListener::bind(addr).await.expect("bind");
+            let listener = TcpListener::bind(any()).await.expect("bind");
+            let addr = listener.local_addr().await.expect("local_addr");
 
             let client = TcpStream::connect(addr).await.expect("connect");
             let (server, _) = listener.accept().await.expect("accept");
@@ -735,39 +824,42 @@ mod tests {
         });
     }
 
-    /// The peer address an accept reports is the connecting socket's own, so a
-    /// connect and the accept that answers it agree on who is at the other end.
+    /// `getsockname` and `getpeername` from both sides of one connection, which
+    /// is the only arrangement that catches the two being swapped.
     #[test]
-    fn an_accepted_peer_is_the_connecting_socket() {
+    fn both_ends_agree_on_who_is_where() {
         let rt = Runtime::new().expect("Runtime::new");
-        let addr = free_addr();
 
         rt.block_on(async move {
-            let listener = TcpListener::bind(addr).await.expect("bind");
+            let listener = TcpListener::bind(any()).await.expect("bind");
+            let addr = listener.local_addr().await.expect("local_addr");
             let client = TcpStream::connect(addr).await.expect("connect");
             let (server, peer) = listener.accept().await.expect("accept");
 
-            // Nothing here knows the client's ephemeral port — `getsockname` is
-            // still out of reach — so this checks what can be checked: the
-            // connection came from the loopback host the connect went to.
-            assert_eq!(peer.ip(), addr.ip());
-            assert_ne!(
-                peer.port(),
-                addr.port(),
-                "an ephemeral port, not the listener's"
-            );
+            // The address the accept reported is the one the client is really
+            // using, ephemeral port and all.
+            assert_eq!(peer, client.local_addr().await.expect("client local"));
 
-            drop((client, server));
+            // And the two ends agree in both directions. Checking only one
+            // direction would not catch `peer` being wired up backwards.
+            assert_eq!(
+                server.local_addr().await.expect("server local"),
+                client.peer_addr().await.expect("client peer"),
+            );
+            assert_eq!(
+                server.peer_addr().await.expect("server peer"),
+                client.local_addr().await.expect("client local"),
+            );
         });
     }
 
     #[test]
     fn a_shutdown_write_is_read_as_end_of_file() {
         let rt = Runtime::new().expect("Runtime::new");
-        let addr = free_addr();
 
         rt.block_on(async move {
-            let listener = TcpListener::bind(addr).await.expect("bind");
+            let listener = TcpListener::bind(any()).await.expect("bind");
+            let addr = listener.local_addr().await.expect("local_addr");
             let client = TcpStream::connect(addr).await.expect("connect");
             let (server, _) = listener.accept().await.expect("accept");
 
@@ -803,10 +895,10 @@ mod tests {
     #[test]
     fn an_abandoned_connect_returns_its_slot() {
         let rt = Runtime::new().expect("Runtime::new");
-        let addr = free_addr();
 
         rt.block_on(async move {
-            let listener = TcpListener::bind(addr).await.expect("bind");
+            let listener = TcpListener::bind(any()).await.expect("bind");
+            let addr = listener.local_addr().await.expect("local_addr");
             let driver = context::driver();
             let before = driver.slots_used();
 
