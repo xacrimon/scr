@@ -16,6 +16,7 @@
 //! does so from a completion, which is what [`close_slot`] is for.
 
 use std::cell::Cell;
+use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::ptr::NonNull;
@@ -156,6 +157,14 @@ impl TcpListener {
     }
 }
 
+impl fmt::Debug for TcpListener {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TcpListener")
+            .field("slot", &self.slot)
+            .finish()
+    }
+}
+
 impl Drop for TcpListener {
     fn drop(&mut self) {
         self.driver.cancel_slot(self.slot);
@@ -253,6 +262,51 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
+    /// Open a connection to `addr`.
+    ///
+    /// The socket and the connect go out as one linked chain, so a connection
+    /// costs a single submission rather than two round trips. As in
+    /// [`TcpListener::bind`], that works because the slot is reserved before
+    /// either entry is built: the connect can name a descriptor the socket
+    /// operation has not created yet.
+    pub async fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
+        let driver = context::driver();
+        let slot = driver
+            .alloc_slot()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENFILE))?;
+
+        let mut peer = SockAddr::from_socket_addr(addr);
+        let addr_ptr = peer.addr_ptr();
+        let addr_len = peer.len();
+
+        let chain = [
+            // As in `bind`, the socket operation's `fd` field holds the address
+            // family rather than a descriptor and its slot is an output, so it
+            // takes neither `FIXED_FILE` nor the slot in `fd`.
+            op::Socket::new()
+                .domain(SockAddr::domain(addr))
+                .kind(libc::SOCK_STREAM as u64)
+                .protocol(0)
+                .slot(slot)
+                .sqe_flags(|f| f | sys::SqeFlags::IO_LINK)
+                .into_sqe(),
+            op::Connect::new()
+                .fd(slot as i32)
+                .addr(addr_ptr)
+                .addrlen(addr_len)
+                .sqe_flags(|f| f | sys::SqeFlags::FIXED_FILE)
+                .into_sqe(),
+        ];
+
+        let data = ConnectChain {
+            driver: Rc::clone(&driver),
+            slot,
+            _addr: peer,
+        };
+
+        Chain::submit(&driver, chain, data).await
+    }
+
     fn new(driver: Rc<Driver>, slot: u32) -> TcpStream {
         TcpStream {
             driver,
@@ -330,6 +384,14 @@ impl AsyncWrite for TcpStream {
     }
 }
 
+impl fmt::Debug for TcpStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TcpStream")
+            .field("slot", &self.slot)
+            .finish()
+    }
+}
+
 impl Drop for TcpStream {
     fn drop(&mut self) {
         // One entry stops everything still running on this slot; without it a
@@ -373,6 +435,36 @@ impl Drop for Busy<'_> {
 // ---------------------------------------------------------------------------
 // Stream operations
 // ---------------------------------------------------------------------------
+
+/// The payload of the socket/connect chain.
+struct ConnectChain {
+    driver: Rc<Driver>,
+    slot: u32,
+    /// Held only so the kernel's pointer to it stays valid for the whole chain.
+    _addr: Box<SockAddr>,
+}
+
+impl ChainCompletable<2> for ConnectChain {
+    type Output = io::Result<TcpStream>;
+
+    fn complete(self, _driver: &Driver, res: [i32; 2]) -> io::Result<TcpStream> {
+        // A failed socket leaves the connect reporting `ECANCELED`, so the first
+        // error is the one that says what actually went wrong.
+        if let Some(&failed) = res.iter().find(|&&r| r < 0) {
+            close_slot(&self.driver, self.slot);
+            return Err(io::Error::from_raw_os_error(-failed));
+        }
+
+        Ok(TcpStream::new(Rc::clone(&self.driver), self.slot))
+    }
+
+    fn cleanup(self, driver: &Driver) {
+        // The chain may have got as far as an open — possibly connected — socket
+        // that nothing now names. Closing a slot that was never filled is
+        // harmless, so this needs no idea of how far it got.
+        close_slot(driver, self.slot);
+    }
+}
 
 struct Recv<B: IoBufMut> {
     buf: B,
@@ -609,6 +701,131 @@ mod tests {
 
             settle(|| driver.slots_used() == before).await;
             drop(client.join().expect("client thread"));
+        });
+    }
+
+    /// Both ends inside the runtime, with no `std::net` anywhere. The connect
+    /// resolves before anyone accepts because the kernel finishes the handshake
+    /// out of the listen backlog, which is what lets a single-threaded test
+    /// drive both halves in sequence.
+    #[test]
+    fn a_connection_made_and_accepted_carries_bytes_both_ways() {
+        let rt = Runtime::new().expect("Runtime::new");
+        let addr = free_addr();
+
+        rt.block_on(async move {
+            let listener = TcpListener::bind(addr).await.expect("bind");
+
+            let client = TcpStream::connect(addr).await.expect("connect");
+            let (server, _) = listener.accept().await.expect("accept");
+
+            let (n, _) = client.write(b"ping".to_vec()).await;
+            assert_eq!(n.expect("write"), 4);
+
+            let (n, buf) = server.read(vec![0u8; 16]).await;
+            assert_eq!(n.expect("read"), 4);
+            assert_eq!(&buf[..4], b"ping");
+
+            let (n, _) = server.write(b"pong".to_vec()).await;
+            assert_eq!(n.expect("write"), 4);
+
+            let (n, buf) = client.read(vec![0u8; 16]).await;
+            assert_eq!(n.expect("read"), 4);
+            assert_eq!(&buf[..4], b"pong");
+        });
+    }
+
+    /// The peer address an accept reports is the connecting socket's own, so a
+    /// connect and the accept that answers it agree on who is at the other end.
+    #[test]
+    fn an_accepted_peer_is_the_connecting_socket() {
+        let rt = Runtime::new().expect("Runtime::new");
+        let addr = free_addr();
+
+        rt.block_on(async move {
+            let listener = TcpListener::bind(addr).await.expect("bind");
+            let client = TcpStream::connect(addr).await.expect("connect");
+            let (server, peer) = listener.accept().await.expect("accept");
+
+            // Nothing here knows the client's ephemeral port — `getsockname` is
+            // still out of reach — so this checks what can be checked: the
+            // connection came from the loopback host the connect went to.
+            assert_eq!(peer.ip(), addr.ip());
+            assert_ne!(
+                peer.port(),
+                addr.port(),
+                "an ephemeral port, not the listener's"
+            );
+
+            drop((client, server));
+        });
+    }
+
+    #[test]
+    fn a_shutdown_write_is_read_as_end_of_file() {
+        let rt = Runtime::new().expect("Runtime::new");
+        let addr = free_addr();
+
+        rt.block_on(async move {
+            let listener = TcpListener::bind(addr).await.expect("bind");
+            let client = TcpStream::connect(addr).await.expect("connect");
+            let (server, _) = listener.accept().await.expect("accept");
+
+            client.shutdown().await.expect("shutdown");
+
+            let (n, _) = server.read(vec![0u8; 16]).await;
+            assert_eq!(n.expect("read"), 0);
+        });
+    }
+
+    #[test]
+    fn a_refused_connection_reports_it_and_returns_the_slot() {
+        let rt = Runtime::new().expect("Runtime::new");
+        // Nothing ever listens here, so the first SYN is answered with a reset.
+        let addr = free_addr();
+
+        rt.block_on(async move {
+            let driver = context::driver();
+            let before = driver.slots_used();
+
+            let err = TcpStream::connect(addr)
+                .await
+                .expect_err("nothing is listening");
+            assert_eq!(err.raw_os_error(), Some(libc::ECONNREFUSED));
+
+            settle(|| driver.slots_used() == before).await;
+        });
+    }
+
+    /// The chain counterpart of [`an_abandoned_accept_returns_its_slot`]: a
+    /// chain dropped mid-flight has a socket somewhere in it that only
+    /// [`ChainCompletable::cleanup`] will ever close.
+    #[test]
+    fn an_abandoned_connect_returns_its_slot() {
+        let rt = Runtime::new().expect("Runtime::new");
+        let addr = free_addr();
+
+        rt.block_on(async move {
+            let listener = TcpListener::bind(addr).await.expect("bind");
+            let driver = context::driver();
+            let before = driver.slots_used();
+
+            let local = noop_local_waker();
+            let mut cx = ContextBuilder::from_waker(Waker::noop())
+                .local_waker(&local)
+                .build();
+
+            // As in the accept case, `Box::pin` so that the drop below drops the
+            // future rather than a pointer to it.
+            let mut connect = Box::pin(TcpStream::connect(addr));
+            assert!(matches!(connect.as_mut().poll(&mut cx), Poll::Pending));
+            assert_eq!(driver.slots_used(), before + 1, "it reserved a slot");
+            drop(connect);
+
+            // Whether the connect beat the cancellation or lost to it, the slot
+            // comes back.
+            settle(|| driver.slots_used() == before).await;
+            drop(listener);
         });
     }
 }
