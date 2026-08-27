@@ -2,6 +2,7 @@
 
 mod runtime;
 mod util;
+mod io_uring;
 
 pub mod task;
 
