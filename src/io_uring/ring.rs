@@ -222,6 +222,22 @@ impl Ring {
         self.enter_flags
     }
 
+    /// Whether completions are waiting that an `io_uring_enter` would deliver.
+    ///
+    /// When the completion ring fills, the kernel parks further completions in
+    /// an internal list and raises [`sys::SqRingFlags::CQ_OVERFLOW`]; they only
+    /// reach the ring on the next enter with
+    /// [`sys::EnterFlags::GETEVENTS`]. [`sys::SqRingFlags::TASKRUN`] means
+    /// pending task work would post more.
+    ///
+    /// Both live in the *submission* ring's flags even though they describe the
+    /// completion side. An empty [`CqRing`] with this set is not an idle ring.
+    pub fn needs_flush(&self) -> bool {
+        self.sq
+            .flags()
+            .intersects(sys::SqRingFlags::CQ_OVERFLOW | sys::SqRingFlags::TASKRUN)
+    }
+
     /// Whether `io_uring_register` should address this ring by registered index
     /// rather than by descriptor.
     ///
@@ -604,6 +620,19 @@ impl CqRing {
         unsafe { self.cqes.as_ptr().add(slot as usize) }
     }
 
+    /// Iterate the completions that are ready right now.
+    ///
+    /// Samples the tail once, so the batch is fixed at the point of the call.
+    /// Entries are released back to the kernel when the iterator is dropped.
+    pub fn completions(&self) -> Completions<'_> {
+        Completions {
+            cq: self,
+            head: self.head(),
+            tail: self.tail(),
+            consumed: 0,
+        }
+    }
+
     /// Release `n` completions back to the kernel.
     ///
     /// Always releases, so the kernel only observes the new head after the CQEs
@@ -614,6 +643,140 @@ impl CqRing {
             // SAFETY: as `head`.
             unsafe { self.head.as_ref() }.store(new, Ordering::Release);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Completions
+// ---------------------------------------------------------------------------
+
+/// The outcome encoded in a completion's `res`, read according to its flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CqeResult {
+    /// Success. The meaning is operation-defined: bytes transferred, a file
+    /// descriptor, a direct descriptor slot, a poll event mask, and so on.
+    Value(u32),
+    /// The operation failed.
+    Error(Errno),
+    /// A zero-copy notification, not a result at all — the send's own outcome
+    /// arrived on a separate completion. `copied` reports that the kernel fell
+    /// back to copying, and is only meaningful when the submission carried
+    /// [`sys::RecvSendFlags::SEND_ZC_REPORT_USAGE`].
+    Notification { copied: bool },
+}
+
+impl sys::Cqe {
+    /// Split this completion into its result or its `-errno`.
+    ///
+    /// Checks [`sys::CqeFlags::NOTIF`] first: on a notification `res` is a flag
+    /// word whose only defined bit is `1 << 31`, which read as a signed integer
+    /// would otherwise look like an enormous negative errno.
+    pub fn result(&self) -> CqeResult {
+        if self.flags.contains(sys::CqeFlags::NOTIF) {
+            let copied = self.res as u32 & sys::NOTIF_USAGE_ZC_COPIED != 0;
+            CqeResult::Notification { copied }
+        } else if self.res < 0 {
+            CqeResult::Error(Errno(-self.res))
+        } else {
+            CqeResult::Value(self.res as u32)
+        }
+    }
+}
+
+/// One completion, copied out of the ring.
+///
+/// Taken by value rather than borrowed: the slot it came from is released back
+/// to the kernel when the iterator that produced it is dropped, so a reference
+/// into the ring could be overwritten while still held.
+#[derive(Debug, Clone, Copy)]
+pub struct Completion {
+    cqe: sys::Cqe,
+    big: Option<[u64; 2]>,
+}
+
+impl Completion {
+    /// The token echoed back from the submission.
+    pub fn user_data(&self) -> u64 {
+        self.cqe.user_data
+    }
+
+    /// The result, interpreted according to the flags.
+    pub fn result(&self) -> CqeResult {
+        self.cqe.result()
+    }
+
+    pub fn flags(&self) -> sys::CqeFlags {
+        self.cqe.flags
+    }
+
+    /// The provided buffer this completion consumed.
+    /// Valid only when [`sys::CqeFlags::BUFFER`] is set.
+    pub fn buffer_id(&self) -> u16 {
+        self.cqe.buffer_id()
+    }
+
+    /// The extra 16 bytes of a 32-byte completion, on rings that post them.
+    pub fn big(&self) -> Option<[u64; 2]> {
+        self.big
+    }
+
+    /// The raw entry.
+    pub fn raw(&self) -> &sys::Cqe {
+        &self.cqe
+    }
+}
+
+/// An iterator over ready completions, releasing them as it goes.
+///
+/// The tail is sampled once, so the batch is whatever was ready when iteration
+/// started. Slots are released on drop, and only those actually yielded — so
+/// breaking out early leaves the rest for the next batch.
+#[derive(Debug)]
+pub struct Completions<'cq> {
+    cq: &'cq CqRing,
+    head: u32,
+    tail: u32,
+    consumed: u32,
+}
+
+impl Iterator for Completions<'_> {
+    type Item = Completion;
+
+    fn next(&mut self) -> Option<Completion> {
+        while self.head != self.tail {
+            // SAFETY: `head` is below the tail sampled at construction and at
+            // or above the ring's head, so the kernel has finished writing it
+            // and will not reuse it until we advance.
+            let cqe = unsafe { *self.cq.cqe(self.head) };
+            let wide = cqe.flags.contains(sys::CqeFlags::F32);
+
+            // A big completion spends two 16-byte slots on a mixed ring; on a
+            // dedicated CQE32 ring the stride already covers it.
+            let slots = 1 + u32::from(wide && self.cq.cqe_shift == 0);
+            let big = (wide || self.cq.cqe_shift == 1).then(|| {
+                // SAFETY: the kernel never lets a big completion straddle the
+                // wrap — it pads with a skip entry instead — so the trailing 16
+                // bytes are contiguous with the ones just read.
+                unsafe { (*self.cq.cqe(self.head).cast::<sys::Cqe32>()).big_cqe }
+            });
+
+            self.head = self.head.wrapping_add(slots);
+            self.consumed += slots;
+
+            // Padding posted to fill a wrap gap. It occupies a slot but is not
+            // a completion, so consume it and keep going.
+            if cqe.flags.contains(sys::CqeFlags::SKIP) {
+                continue;
+            }
+            return Some(Completion { cqe, big });
+        }
+        None
+    }
+}
+
+impl Drop for Completions<'_> {
+    fn drop(&mut self) {
+        self.cq.advance(self.consumed);
     }
 }
 
@@ -726,6 +889,155 @@ mod tests {
             Errno(libc::EEXIST),
             "registering twice should be rejected"
         );
+    }
+
+    /// `res` is only an errno when the completion is not a zero-copy
+    /// notification. `IORING_NOTIF_USAGE_ZC_COPIED` is `1 << 31`, which as a
+    /// signed int is negative and would otherwise read as a huge errno.
+    #[test]
+    fn notification_res_is_not_an_errno() {
+        let notif = sys::Cqe {
+            user_data: 1,
+            res: sys::NOTIF_USAGE_ZC_COPIED as i32,
+            flags: sys::CqeFlags::NOTIF,
+        };
+        assert!(
+            notif.res < 0,
+            "the trap only exists because this is negative"
+        );
+        assert_eq!(notif.result(), CqeResult::Notification { copied: true });
+
+        let plain = sys::Cqe {
+            user_data: 1,
+            res: 0,
+            flags: sys::CqeFlags::NOTIF,
+        };
+        assert_eq!(plain.result(), CqeResult::Notification { copied: false });
+
+        let ok = sys::Cqe {
+            user_data: 1,
+            res: 17,
+            flags: sys::CqeFlags::empty(),
+        };
+        assert_eq!(ok.result(), CqeResult::Value(17));
+
+        let err = sys::Cqe {
+            user_data: 1,
+            res: -libc::ENOBUFS,
+            flags: sys::CqeFlags::empty(),
+        };
+        assert_eq!(err.result(), CqeResult::Error(Errno::NOBUFS));
+    }
+
+    /// The iterator must yield every completion, release exactly what it
+    /// yielded, and leave the ring empty afterwards.
+    #[test]
+    #[cfg_attr(miri, ignore = "issues real syscalls and mmaps a ring")]
+    fn completions_drain_the_ring() {
+        let mut params = sys::Params::default();
+        let ring = Ring::with_params(8, &mut params).expect("Ring::with_params");
+        let _ = nops(&ring, 0);
+
+        let sq = ring.sq();
+        let tail = sq.tail();
+        for i in 0..4u32 {
+            // SAFETY: the ring is idle, so these slots are ours.
+            unsafe {
+                sq.sqe(tail + i).write(sys::Sqe {
+                    opcode: sys::Opcode::Nop,
+                    user_data: i as u64,
+                    ..sys::Sqe::ZEROED
+                })
+            };
+        }
+        sq.set_tail(tail + 4);
+        // SAFETY: no argument, and the SQEs above are well formed nops.
+        unsafe {
+            syscall::io_uring_enter(
+                ring.enter_fd(),
+                4,
+                4,
+                ring.enter_flags() | sys::EnterFlags::GETEVENTS,
+                std::ptr::null(),
+                0,
+            )
+        }
+        .expect("io_uring_enter");
+
+        let cq = ring.cq();
+        assert_eq!(cq.ready(), 4);
+        let seen: Vec<_> = cq
+            .completions()
+            .map(|c| {
+                (
+                    c.user_data(),
+                    c.result(),
+                    c.flags().contains(sys::CqeFlags::MORE),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            (0..4)
+                .map(|i| (i as u64, CqeResult::Value(0), false))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(cq.ready(), 0, "the iterator must release what it yielded");
+    }
+
+    /// Breaking out early must release only what was actually taken, leaving
+    /// the rest for the next batch.
+    #[test]
+    #[cfg_attr(miri, ignore = "issues real syscalls and mmaps a ring")]
+    fn a_partial_drain_leaves_the_rest() {
+        let mut params = sys::Params::default();
+        let ring = Ring::with_params(8, &mut params).expect("Ring::with_params");
+
+        let sq = ring.sq();
+        let tail = sq.tail();
+        for i in 0..4u32 {
+            // SAFETY: the ring is idle, so these slots are ours.
+            unsafe {
+                sq.sqe(tail + i).write(sys::Sqe {
+                    opcode: sys::Opcode::Nop,
+                    user_data: i as u64,
+                    ..sys::Sqe::ZEROED
+                })
+            };
+        }
+        sq.set_tail(tail + 4);
+        // SAFETY: as above.
+        unsafe {
+            syscall::io_uring_enter(
+                ring.enter_fd(),
+                4,
+                4,
+                ring.enter_flags() | sys::EnterFlags::GETEVENTS,
+                std::ptr::null(),
+                0,
+            )
+        }
+        .expect("io_uring_enter");
+
+        let cq = ring.cq();
+        let first: Vec<_> = cq.completions().take(2).map(|c| c.user_data()).collect();
+        assert_eq!(first, vec![0, 1]);
+        assert_eq!(cq.ready(), 2, "only the taken entries should be released");
+
+        let rest: Vec<_> = cq.completions().map(|c| c.user_data()).collect();
+        assert_eq!(rest, vec![2, 3]);
+        assert_eq!(cq.ready(), 0);
+    }
+
+    /// An idle ring with nothing pending needs no flush.
+    #[test]
+    #[cfg_attr(miri, ignore = "issues real syscalls and mmaps a ring")]
+    fn an_idle_ring_needs_no_flush() {
+        let mut params = sys::Params::default();
+        let ring = Ring::with_params(8, &mut params).expect("Ring::with_params");
+        assert!(!ring.needs_flush());
+        assert_eq!(nops(&ring, 1), vec![(0, 0)]);
+        assert!(!ring.needs_flush());
     }
 
     /// Two rings can exist at once and tear down independently.

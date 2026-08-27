@@ -51,6 +51,9 @@ impl Errno {
     pub const NOSYS: Errno = Errno(libc::ENOSYS);
     /// The kernel does not support this opcode or flag.
     pub const OPNOTSUPP: Errno = Errno(libc::EOPNOTSUPP);
+    /// No provided buffer was available. Arrives in `cqe.res`, never from a
+    /// syscall; on a multishot operation it is terminal.
+    pub const NOBUFS: Errno = Errno(libc::ENOBUFS);
 
     /// The errno most recently set by a failing libc call.
     fn last() -> Errno {
