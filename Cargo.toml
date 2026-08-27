@@ -9,3 +9,4 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(scr_unstable)'] }
 [dependencies]
 slab = "0.4.12"
 bitflags = "2.13.1"
+libc = "0.2"

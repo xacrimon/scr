@@ -14,7 +14,7 @@
 //! by writing the right integer into the slot. All such punning assumes a
 //! little-endian target, which io_uring effectively requires anyway.
 
-#![allow(unused)]
+#![allow(dead_code)]
 
 use bitflags::bitflags;
 
@@ -179,7 +179,10 @@ impl Sqe {
 
     /// A zeroed SQE with `opcode` set. Every other field is left for the caller.
     pub const fn new(opcode: Opcode) -> Sqe {
-        Sqe { opcode, ..Sqe::ZEROED }
+        Sqe {
+            opcode,
+            ..Sqe::ZEROED
+        }
     }
 }
 
@@ -208,23 +211,39 @@ pub struct Sqe128 {
 }
 
 impl Sqe128 {
-    pub const ZEROED: Sqe128 = Sqe128 { sqe: Sqe::ZEROED, tail: [0; 64] };
+    pub const ZEROED: Sqe128 = Sqe128 {
+        sqe: Sqe::ZEROED,
+        tail: [0; 64],
+    };
 
     pub const fn new(opcode: Opcode) -> Sqe128 {
-        Sqe128 { sqe: Sqe::new(opcode), tail: [0; 64] }
+        Sqe128 {
+            sqe: Sqe::new(opcode),
+            tail: [0; 64],
+        }
     }
 
     /// The 80-byte `cmd[]` payload at offset 48.
     pub fn cmd(&self) -> &[u8; 80] {
         // SAFETY: offset 48 + 80 == 128 == size_of::<Sqe128>(), and [u8; 80]
         // has alignment 1, so the projection is in bounds and well aligned.
-        unsafe { &*core::ptr::from_ref(self).cast::<u8>().add(48).cast::<[u8; 80]>() }
+        unsafe {
+            &*core::ptr::from_ref(self)
+                .cast::<u8>()
+                .add(48)
+                .cast::<[u8; 80]>()
+        }
     }
 
     /// Mutable view of the 80-byte `cmd[]` payload at offset 48.
     pub fn cmd_mut(&mut self) -> &mut [u8; 80] {
         // SAFETY: as above; `Sqe128` has no padding and every byte is init.
-        unsafe { &mut *core::ptr::from_mut(self).cast::<u8>().add(48).cast::<[u8; 80]>() }
+        unsafe {
+            &mut *core::ptr::from_mut(self)
+                .cast::<u8>()
+                .add(48)
+                .cast::<[u8; 80]>()
+        }
     }
 }
 

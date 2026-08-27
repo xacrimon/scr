@@ -1,8 +1,8 @@
 #![feature(local_waker)]
 
+mod io_uring;
 mod runtime;
 mod util;
-mod io_uring;
 
 pub mod task;
 
