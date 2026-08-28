@@ -12,6 +12,9 @@ const ARITY: usize = 4;
 /// once more than `1 / REBUILD_RATIO` of it is due.
 const REBUILD_RATIO: usize = 8;
 
+/// Timers to take one at a time before falling back to a sweep.
+const SWEEP_AFTER: usize = 4;
+
 /// A handle to one armed timer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct TimerKey(usize);
@@ -152,13 +155,48 @@ impl Timers {
     }
 
     /// Wake everything due at `now`, returning how many fired.
-    ///
-    /// One pass over the store, then the wakes — see [`Inner::take_due`] for why
-    /// it is not a loop of pops.
     pub(crate) fn expire(&self, now: u64) -> usize {
-        // Taken out rather than borrowed across the wakes below. Waking pushes
-        // onto the run queue and a future is free to arm another timer from
-        // there, so nothing here may be borrowed while it happens.
+        let mut fired = 0;
+
+        while fired < SWEEP_AFTER {
+            if !self.next_is_due(now) {
+                return fired;
+            }
+
+            if let Some(waker) = self.pop_root() {
+                waker.wake();
+            }
+
+            fired += 1;
+        }
+
+        fired + self.sweep(now)
+    }
+
+    /// Whether the earliest deadline has arrived.
+    fn next_is_due(&self, now: u64) -> bool {
+        self.inner
+            .borrow()
+            .heap
+            .first()
+            .is_some_and(|slot| slot.deadline <= now)
+    }
+
+    /// Take the earliest timer, returning whoever was waiting on it.
+    fn pop_root(&self) -> Option<LocalWaker> {
+        let mut inner = self.inner.borrow_mut();
+
+        let index = inner.heap.first().expect("the caller found one due").index;
+        inner.unlink(0);
+
+        let entry = &mut inner.entries[index];
+        entry.pos = None;
+
+        entry.waker.take()
+    }
+
+    /// Take every due timer in one pass.
+    fn sweep(&self, now: u64) -> usize {
         let mut ready = mem::take(&mut *self.ready.borrow_mut());
         debug_assert!(ready.is_empty(), "a previous sweep left wakers behind");
 
@@ -172,36 +210,12 @@ impl Timers {
         fired
     }
 
-    /// Take the earliest timer if it is due, along with whoever was waiting on
-    /// it. `Some(None)` is a timer that expired before anybody polled it.
-    #[cfg(test)]
-    fn pop_due(&self, now: u64) -> Option<Option<LocalWaker>> {
-        let mut inner = self.inner.borrow_mut();
-
-        let &Slot { deadline, index } = inner.heap.first()?;
-        if deadline > now {
-            return None;
-        }
-
-        inner.unlink(0);
-
-        let entry = &mut inner.entries[index];
-        // The entry outlives its place in the heap: the future that armed it
-        // still holds the key and still has to observe the expiry, and it is
-        // that future's `Drop` that finally frees this slot.
-        entry.pos = None;
-
-        Some(entry.waker.take())
-    }
-
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.inner.borrow().heap.len()
     }
 
-    /// Entries alive, pending and fired-but-uncollected together. The number
-    /// that must come back to zero, and the one a tombstoning heap would let
-    /// drift.
+
     #[cfg(test)]
     pub(crate) fn entries(&self) -> usize {
         self.inner.borrow().entries.len()
@@ -467,7 +481,8 @@ mod tests {
 
         for &deadline in &sorted {
             assert_eq!(timers.earliest(), Some(deadline));
-            timers.pop_due(deadline).expect("due");
+            assert!(timers.next_is_due(deadline));
+            timers.pop_root();
             check(&timers);
         }
 
@@ -489,10 +504,8 @@ mod tests {
             timers.insert(deadline);
         }
 
-        assert!(
-            timers.pop_due(9).is_none(),
-            "nothing is due before the first"
-        );
+        assert!(!timers.next_is_due(9), "nothing is due before the first");
+        assert_eq!(timers.expire(9), 0);
         assert_eq!(timers.len(), SPREAD.len());
 
         // The three at 10 and 10 and 20.
@@ -604,15 +617,10 @@ mod tests {
         timers.remove(key);
     }
 
-    /// The property both expiry paths have to share: [`Timers::expire`] fires
-    /// exactly the set [`Timers::pop_due`] would have, and leaves a heap behind.
-    ///
-    /// Randomised over the shapes that decide which path runs — the cutoff
-    /// sweeps from below every deadline to above all of them, so both the
-    /// individual unlinks and the full rebuild are exercised, along with the
-    /// boundary between them.
+    /// The property every expiry tier has to share: [`Timers::expire`] fires
+    /// exactly the timers at or before the cutoff, and leaves a heap behind.
     #[test]
-    fn batched_expiry_agrees_with_popping_one_at_a_time() {
+    fn expiry_fires_exactly_the_timers_that_are_due() {
         let mut rng = 0x243F_6A88_85A3_08D3u64;
         let mut next = move || {
             rng ^= rng << 13;
@@ -621,8 +629,9 @@ mod tests {
             rng
         };
 
-        let mut rebuilds = 0;
+        let mut pops = 0;
         let mut unlinks = 0;
+        let mut rebuilds = 0;
 
         for _ in 0..500 {
             let count = 1 + (next() % 400) as usize;
@@ -630,28 +639,20 @@ mod tests {
             // Deliberately reaches past both ends of the range.
             let cutoff = next() % 1_100;
 
-            let fill = |timers: &Timers| -> Vec<TimerKey> {
-                deadlines.iter().map(|&d| timers.insert(d)).collect()
-            };
+            // Derived from what a timer store means rather than from a second
+            // implementation, so that a mistake both paths share — an off-by-one
+            // at the cutoff, say — still fails this.
+            let expected = deadlines.iter().filter(|&&d| d <= cutoff).count();
 
-            // Reference: one pop at a time.
-            let reference = Timers::new();
-            let reference_keys = fill(&reference);
-            let mut expected = 0;
-            while reference.pop_due(cutoff).is_some() {
-                expected += 1;
-            }
-            check(&reference);
-
-            // The batched path.
             let batched = Timers::new();
-            let batched_keys = fill(&batched);
+            let batched_keys: Vec<TimerKey> =
+                deadlines.iter().map(|&d| batched.insert(d)).collect();
             let fired = batched.expire(cutoff);
             check(&batched);
 
             assert_eq!(
                 fired, expected,
-                "{count} timers, cutoff {cutoff}: batched fired {fired}, popping fired {expected}"
+                "{count} timers, cutoff {cutoff}: fired {fired}, {expected} were due"
             );
             assert_eq!(
                 batched.len(),
@@ -659,7 +660,9 @@ mod tests {
                 "the survivors were miscounted"
             );
 
-            if expected * REBUILD_RATIO < count {
+            if expected <= SWEEP_AFTER {
+                pops += 1;
+            } else if expected * REBUILD_RATIO < count {
                 unlinks += 1;
             } else {
                 rebuilds += 1;
@@ -669,27 +672,26 @@ mod tests {
             // out, in order, and nothing else does.
             let mut last = 0;
             let mut drained = 0;
-            while batched.pop_due(u64::MAX - 1).is_some() {
-                let earliest = batched.earliest().unwrap_or(u64::MAX);
-                assert!(earliest >= last, "the survivors came out of order");
-                last = earliest;
+            while batched.next_is_due(u64::MAX - 1) {
+                let deadline = batched.earliest().expect("one is due");
+                assert!(deadline >= last, "the survivors came out of order");
+                last = deadline;
+                batched.pop_root();
                 drained += 1;
             }
             assert_eq!(drained, count - expected, "a survivor was lost");
             check(&batched);
 
-            for key in reference_keys {
-                reference.remove(key);
-            }
             for key in batched_keys {
                 batched.remove(key);
             }
             assert_eq!(batched.entries(), 0, "entries outlived their futures");
         }
 
-        // The randomisation is only worth anything if it reached both paths.
-        assert!(rebuilds > 20, "the rebuild path ran only {rebuilds} times");
-        assert!(unlinks > 20, "the unlink path ran only {unlinks} times");
+        // The randomisation is only worth anything if it reached every tier.
+        assert!(pops > 20, "the pop tier ran only {pops} times");
+        assert!(unlinks > 20, "the unlink tier ran only {unlinks} times");
+        assert!(rebuilds > 20, "the rebuild tier ran only {rebuilds} times");
     }
 
     /// The rebuild path specifically, at a size where it is the one that runs.
