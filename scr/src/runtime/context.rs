@@ -38,7 +38,7 @@ thread_local! {
 /// entered, which the runtime is for the whole of `block_on`, `spawn` and its
 /// own shutdown.
 #[track_caller]
-pub(crate) fn with_handle<R>(f: impl FnOnce(&Handle) -> R) -> R {
+pub(crate) fn with_handle<T>(f: impl FnOnce(&Handle) -> T) -> T {
     let handle = CONTEXT
         .with(|ctx| ctx.handle.get())
         .expect("called from outside of a runtime");
@@ -73,11 +73,6 @@ pub(crate) fn driver() -> Rc<Driver> {
 #[track_caller]
 pub(crate) fn timers() -> Rc<Timers> {
     with_handle(|handle| Rc::clone(handle.timers()))
-}
-
-#[track_caller]
-pub fn rand32_next_u32_below(max: u32) -> u32 {
-    with_handle(|handle| handle.rng().borrow_mut().next_u32_below(max))
 }
 
 /// Enters `handle` until the returned guard is dropped, so that spawning and

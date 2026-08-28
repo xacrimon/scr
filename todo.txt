@@ -1,7 +1,6 @@
 select + timer? timeouts?
 
 more time spent in runtime code vs tokio?
-coalesce timers when sleeping in reactor
 
 io uring for sock_name?
 
