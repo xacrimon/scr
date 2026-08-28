@@ -18,22 +18,10 @@ use self::stub_waker::stub_waker;
 use self::task::JoinHandle;
 
 /// How long to keep polling tasks before turning the reactor.
-///
-/// A time budget rather than a task count because task polls vary by orders of
-/// magnitude, and what actually needs bounding is the latency an operation's
-/// completion waits through — under
-/// [`DEFER_TASKRUN`](io_uring::sys::SetupFlags::DEFER_TASKRUN) nothing is
-/// delivered until we next enter the kernel.
-///
-/// [io_uring]: crate::io_uring
 const POLL_BUDGET: Duration = Duration::from_micros(100);
 
 /// Tasks to poll between readings of the clock.
-///
-/// `Instant::now` is a vDSO call of some twenty nanoseconds. Against a task poll
-/// that can be shorter than that, reading it every time would spend a noticeable
-/// fraction of the budget measuring the budget.
-const CLOCK_INTERVAL: u32 = 10;
+const CLOCK_INTERVAL: u32 = 5;
 
 pub struct Runtime {
     handle: Handle,
