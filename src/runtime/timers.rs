@@ -120,11 +120,7 @@ impl Timers {
             // Still pending: shift it and let the heap re-settle. The new
             // deadline can be either side of the old one, so this may go up or
             // down.
-            Some(pos) => {
-                inner.heap[pos].deadline = deadline;
-                let settled = inner.sift_up(pos);
-                inner.sift_down(settled);
-            }
+            Some(pos) => inner.settle(pos, Slot { deadline, index }),
             // Already fired, so it is out of the heap and has to go back in.
             None => inner.push(Slot { deadline, index }),
         }
@@ -221,24 +217,35 @@ impl Inner {
 
     fn push(&mut self, slot: Slot) {
         let pos = self.heap.len();
+        // Reserves the cell only; `sift_up` decides what actually lands there
+        // and records the position once, when it stops.
         self.heap.push(slot);
-        self.entries[slot.index].pos = Some(pos);
-        self.sift_up(pos);
+        self.sift_up(pos, slot);
     }
 
     /// Take the slot at `pos` out of the heap, filling the hole with the last
     /// element and letting it settle.
+    ///
+    /// Does not touch the entry at `pos` — the caller has either just removed it
+    /// from the slab or is about to mark it fired.
     fn unlink(&mut self, pos: usize) {
         let last = self.heap.pop().expect("pos indexes a non-empty heap");
 
         if pos == self.heap.len() {
-            // It *was* the last element; the pop was the removal.
             return;
         }
 
-        self.place(pos, last);
-        let settled = self.sift_up(pos);
-        self.sift_down(settled);
+        self.settle(pos, last);
+    }
+
+    /// Seat `slot` in the hole at `pos`, moving the hole to wherever `slot`
+    /// belongs.
+    fn settle(&mut self, pos: usize, slot: Slot) {
+        if pos > 0 && self.heap[(pos - 1) / ARITY].deadline > slot.deadline {
+            self.sift_up(pos, slot);
+        } else {
+            self.sift_down(pos, slot);
+        }
     }
 
     /// Take every timer due at `now` out of the heap, collecting the wakers of
@@ -317,7 +324,8 @@ impl Inner {
             // `(len - 2) / ARITY` is the parent of the last element, and so the
             // last node with any children at all.
             for pos in (0..=(len - 2) / ARITY).rev() {
-                self.sift_down_detached(pos);
+                let slot = self.heap[pos];
+                self.sift_down_detached(pos, slot);
             }
         }
 
@@ -326,11 +334,9 @@ impl Inner {
         }
     }
 
-    /// Move the slot at `pos` up while it is earlier than its parent, returning
-    /// where it came to rest.
-    fn sift_up(&mut self, mut pos: usize) -> usize {
-        let slot = self.heap[pos];
-
+    /// Walk the hole at `pos` up, pulling parents down into it while they are
+    /// later than `slot`, then seat `slot` where it stops.
+    fn sift_up(&mut self, mut pos: usize, slot: Slot) {
         while pos > 0 {
             let parent = (pos - 1) / ARITY;
             if self.heap[parent].deadline <= slot.deadline {
@@ -343,13 +349,11 @@ impl Inner {
         }
 
         self.place(pos, slot);
-        pos
     }
 
-    /// Move the slot at `pos` down while a child is earlier than it.
-    fn sift_down(&mut self, mut pos: usize) {
-        let slot = self.heap[pos];
-
+    /// Walk the hole at `pos` down, pulling the earliest child up into it while
+    /// that child is earlier than `slot`, then seat `slot` where it stops.
+    fn sift_down(&mut self, mut pos: usize, slot: Slot) {
         while let Some(child) = self.earliest_child(pos, slot.deadline) {
             let down = self.heap[child];
             self.place(pos, down);
@@ -361,9 +365,7 @@ impl Inner {
 
     /// [`sift_down`](Inner::sift_down) without maintaining [`Entry::pos`], for
     /// [`rebuild`](Inner::rebuild), which sets every position afterwards anyway.
-    fn sift_down_detached(&mut self, mut pos: usize) {
-        let slot = self.heap[pos];
-
+    fn sift_down_detached(&mut self, mut pos: usize, slot: Slot) {
         while let Some(child) = self.earliest_child(pos, slot.deadline) {
             self.heap[pos] = self.heap[child];
             pos = child;
