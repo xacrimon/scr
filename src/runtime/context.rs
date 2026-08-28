@@ -6,6 +6,7 @@ use std::rc::Rc;
 use crate::runtime::driver::Driver;
 use crate::runtime::sched::Handle;
 use crate::runtime::task::Id;
+use crate::runtime::timers::Timers;
 
 struct Context {
     /// The runtime the current thread is entered into, if any.
@@ -59,6 +60,19 @@ pub(crate) fn with_handle<R>(f: impl FnOnce(&Handle) -> R) -> R {
 #[track_caller]
 pub(crate) fn driver() -> Rc<Driver> {
     with_handle(|handle| Rc::clone(handle.driver()))
+}
+
+/// The timer store of the runtime the current thread is entered into.
+///
+/// Handed out by `Rc` for the same reason as [`driver`]: an armed timer is
+/// disarmed from its future's `Drop`, which can run with no runtime entered.
+///
+/// # Panics
+///
+/// Panics if the current thread is not inside a runtime.
+#[track_caller]
+pub(crate) fn timers() -> Rc<Timers> {
+    with_handle(|handle| Rc::clone(handle.timers()))
 }
 
 /// Enters `handle` until the returned guard is dropped, so that spawning and

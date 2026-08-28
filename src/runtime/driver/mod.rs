@@ -27,7 +27,9 @@ pub(crate) mod op;
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::ffi::c_void;
 use std::ptr;
+use std::time::Duration;
 
 use crate::io_uring::fixed::FixedFiles;
 use crate::io_uring::op as uring_op;
@@ -52,6 +54,29 @@ const FILE_SLOTS: u32 = 1024;
 
 /// Slots left to the kernel's own allocator.
 const KERNEL_SLOTS: u32 = 256;
+
+/// What [`Driver::turn`] should do once it has submitted what is queued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Turn {
+    /// Collect whatever has already completed and come straight back. For when
+    /// there is other work to get on with.
+    Flush,
+
+    /// Block until at least one completion arrives.
+    ///
+    /// The caller must have checked that something is actually outstanding.
+    Wait,
+
+    /// Block until a completion arrives or `timeout` elapses, whichever comes
+    /// first.
+    WaitFor(Duration),
+}
+
+impl Turn {
+    fn blocks(self) -> bool {
+        !matches!(self, Turn::Flush)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Driver
@@ -327,16 +352,15 @@ impl Driver {
 
     /// Submit what is queued and collect whatever has completed.
     ///
-    /// With `wait`, blocks until at least one completion arrives; the caller
-    /// must have checked that something is actually outstanding, or it will
-    /// block forever. Without it, this is a flush.
+    /// See [`Turn`] for what the three modes cost and what each of them
+    /// requires of the caller.
     ///
     /// "Submit" means queued for the kernel, not handed to it: a backlog too
     /// small to fill the ring is left in the ring for the next call to take out.
     /// Callers that need everything through — [`Driver::shutdown`] and the like
     /// — already loop until nothing is outstanding, which covers it.
-    pub(crate) fn turn(&self, wait: bool) -> Result<(), Errno> {
-        let mut wait = wait;
+    pub(crate) fn turn(&self, turn: Turn) -> Result<(), Errno> {
+        let mut turn = turn;
 
         loop {
             let backlog_before = self.sub.borrow().backlog.len();
@@ -351,34 +375,11 @@ impl Driver {
 
             // Nothing queued, nobody to wait for, nothing outstanding: entering
             // the kernel could not tell us anything.
-            if to_submit == 0 && !wait && self.in_flight() == 0 {
+            if to_submit == 0 && !turn.blocks() && self.in_flight() == 0 {
                 return Ok(());
             }
 
-            // SAFETY: no argument is passed, so `arg` and `argsz` are trivially
-            // valid for these flags. Every queued entry was built by `op`, and
-            // anything it points at is owned by a ledger entry that outlives the
-            // operation — that is what detaching is for.
-            let entered = unsafe {
-                syscall::io_uring_enter(
-                    self.ring.enter_fd(),
-                    to_submit,
-                    wait as u32,
-                    self.ring.enter_flags() | sys::EnterFlags::GETEVENTS,
-                    ptr::null(),
-                    0,
-                )
-            };
-
-            match entered {
-                Ok(_) => {}
-                // Interrupted, nothing ready, or no room to post more
-                // completions. All three want the same thing: reap, and let
-                // whatever was not submitted wait on the backlog.
-                Err(Errno::INTR) | Err(Errno::AGAIN) | Err(Errno::BUSY) => {}
-                Err(e) => return Err(e),
-            }
-
+            self.enter(to_submit, turn)?;
             self.reap();
 
             let mut sub = self.sub.borrow_mut();
@@ -401,7 +402,71 @@ impl Driver {
             }
 
             drop(sub);
-            wait = false;
+            // Whatever we were waiting for either arrived or timed out; the
+            // remaining passes are only here to push the backlog through.
+            turn = Turn::Flush;
+        }
+    }
+
+    /// One `io_uring_enter`, with the wait bounded as `turn` asks.
+    fn enter(&self, to_submit: u32, turn: Turn) -> Result<(), Errno> {
+        let flags = self.ring.enter_flags() | sys::EnterFlags::GETEVENTS;
+        let min_complete = turn.blocks() as u32;
+
+        let entered = match turn {
+            Turn::Flush | Turn::Wait => {
+                // SAFETY: no argument is passed, so `arg` and `argsz` are
+                // trivially valid for these flags. Every queued entry was built
+                // by `op`, and anything it points at is owned by a ledger entry
+                // that outlives the operation — that is what detaching is for.
+                unsafe {
+                    syscall::io_uring_enter(
+                        self.ring.enter_fd(),
+                        to_submit,
+                        min_complete,
+                        flags,
+                        ptr::null(),
+                        0,
+                    )
+                }
+            }
+            Turn::WaitFor(timeout) => {
+                // Relative rather than `EnterFlags::ABS_TIMER`, so that nothing
+                // here depends on `Instant` being `CLOCK_MONOTONIC` — which it
+                // is on Linux, but not by any promise `std` makes.
+                let ts = sys::Timespec {
+                    tv_sec: timeout.as_secs() as i64,
+                    tv_nsec: timeout.subsec_nanos() as i64,
+                };
+                let arg = sys::GeteventsArg {
+                    sigmask: 0,
+                    sigmask_sz: 0,
+                    min_wait_usec: 0,
+                    ts: &raw const ts as u64,
+                };
+
+                // SAFETY: `arg` is a live `GeteventsArg` for the duration of the
+                // call and `EXT_ARG` is set to say so, and the `Timespec` it
+                // points at outlives it. Submitted entries are as above.
+                unsafe {
+                    syscall::io_uring_enter(
+                        self.ring.enter_fd(),
+                        to_submit,
+                        min_complete,
+                        flags | sys::EnterFlags::EXT_ARG,
+                        &raw const arg as *const c_void,
+                        size_of::<sys::GeteventsArg>(),
+                    )
+                }
+            }
+        };
+
+        match entered {
+            Ok(_) => Ok(()),
+            // Interrupted, nothing ready, no room to post more completions, or
+            // the wait timed out.
+            Err(Errno::INTR) | Err(Errno::AGAIN) | Err(Errno::BUSY) | Err(Errno::TIME) => Ok(()),
+            Err(e) => Err(e),
         }
     }
 
@@ -438,7 +503,7 @@ impl Driver {
         }
 
         while self.in_flight() > 0 {
-            if self.turn(true).is_err() {
+            if self.turn(Turn::Wait).is_err() {
                 break;
             }
         }
@@ -511,7 +576,7 @@ mod tests {
     /// Drain, without waiting on a ring that has nothing left to give.
     fn drain(driver: &Driver) {
         while driver.in_flight() > 0 {
-            driver.turn(true).expect("turn");
+            driver.turn(Turn::Wait).expect("turn");
         }
     }
 
@@ -551,7 +616,7 @@ mod tests {
             "four of twelve do not fit a ring of eight"
         );
 
-        driver.turn(false).expect("turn");
+        driver.turn(Turn::Flush).expect("turn");
 
         assert!(
             !driver.backlog_pending(),
@@ -639,7 +704,7 @@ mod tests {
     fn an_idle_turn_is_free() {
         let driver = driver();
 
-        driver.turn(false).expect("turn");
+        driver.turn(Turn::Flush).expect("turn");
         assert_eq!(driver.in_flight(), 0);
     }
 }

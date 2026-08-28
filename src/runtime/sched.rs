@@ -8,6 +8,7 @@ use std::rc::Rc;
 
 use crate::runtime::driver::Driver;
 use crate::runtime::task::{Header, JoinHandle, OwnedTasks, Runnable, Task};
+use crate::runtime::timers::Timers;
 
 const BASE_QUEUE_CAPACITY: usize = 1024;
 
@@ -17,6 +18,8 @@ pub(crate) struct Handle {
     /// Shared with every socket, which needs it in its own `Drop` — after the
     /// runtime may already have gone.
     driver: Rc<Driver>,
+    /// Shared with every armed timer, for the same reason.
+    timers: Rc<Timers>,
 }
 
 impl Handle {
@@ -25,11 +28,16 @@ impl Handle {
             queue: Queue::new(),
             owned: OwnedTasks::new(),
             driver: Rc::new(Driver::new()?),
+            timers: Rc::new(Timers::new()),
         })
     }
 
     pub(crate) fn driver(&self) -> &Rc<Driver> {
         &self.driver
+    }
+
+    pub(crate) fn timers(&self) -> &Rc<Timers> {
+        &self.timers
     }
 
     pub(crate) fn queue_is_empty(&self) -> bool {

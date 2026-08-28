@@ -2,6 +2,7 @@ pub(crate) mod context;
 pub(crate) mod driver;
 pub(crate) mod sched;
 pub(crate) mod task;
+pub(crate) mod timers;
 
 mod blocked_on;
 mod stub_waker;
@@ -11,8 +12,9 @@ use std::marker::PhantomData;
 use std::panic::Location;
 use std::pin::pin;
 use std::task::{ContextBuilder, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use self::driver::Turn;
 use self::sched::Handle;
 use self::stub_waker::stub_waker;
 use self::task::JoinHandle;
@@ -65,6 +67,7 @@ impl Runtime {
             .build();
 
         let driver = self.handle.driver();
+        let timers = self.handle.timers();
 
         loop {
             // Only poll the blocked-on future when it has actually been woken.
@@ -74,7 +77,12 @@ impl Runtime {
                 return output;
             }
 
-            let deadline = Instant::now() + POLL_BUDGET;
+            let now = timers.now();
+            let budget_ends = now + POLL_BUDGET.as_nanos() as u64;
+            let batch_ends = match timers.earliest() {
+                Some(deadline) => deadline.min(budget_ends),
+                None => budget_ends,
+            };
             let mut polled = 0u32;
 
             while let Some(task) = self.handle.next_task() {
@@ -85,25 +93,37 @@ impl Runtime {
                     break;
                 }
 
-                if polled.is_multiple_of(CLOCK_INTERVAL) && Instant::now() >= deadline {
+                if polled.is_multiple_of(CLOCK_INTERVAL) && timers.now() >= batch_ends {
                     break;
                 }
             }
 
-            // Nothing runnable, nothing woken, and nothing in the kernel that
-            // could ever change that.
+            // Before the idle check below, because this is one of the two things
+            // that can put work back on an empty queue.
+            timers.expire(timers.now());
+
             let idle = self.handle.queue_is_empty() && !signal.is_notified();
-            if idle && driver.in_flight() == 0 {
-                panic!(
-                    "`block_on` deadlocked: the run queue is empty, the blocked-on \
-                     future is pending, and no operation is in flight. This runtime's \
-                     wakers are thread affine, so nothing can wake it."
-                );
+            if !idle {
+                // There is more to do, so this is a flush: submit what the batch
+                // queued and collect whatever came back, without waiting.
+                driver.turn(Turn::Flush).expect("io_uring_enter");
+                continue;
             }
 
-            // Waiting only when there is nothing else to do; otherwise this is a
-            // flush that collects whatever has completed and goes back to work.
-            driver.turn(idle).expect("io_uring_enter");
+            let now = timers.now();
+            let turn = match timers.earliest() {
+                Some(deadline) if deadline <= now => Turn::Flush,
+                Some(deadline) => Turn::WaitFor(Duration::from_nanos(deadline - now)),
+                None if driver.in_flight() == 0 => panic!(
+                    "`block_on` deadlocked: the run queue is empty, the blocked-on \
+                     future is pending, no timer is armed, and no operation is in \
+                     flight. This runtime's wakers are thread affine, so nothing \
+                     can wake it."
+                ),
+                None => Turn::Wait,
+            };
+
+            driver.turn(turn).expect("io_uring_enter");
         }
     }
 }
