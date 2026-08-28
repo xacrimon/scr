@@ -1,4 +1,4 @@
-use std::cell::UnsafeCell;
+use std::cell::{RefCell, UnsafeCell};
 use std::collections::VecDeque;
 use std::io;
 use std::marker::PhantomData;
@@ -9,6 +9,7 @@ use std::rc::Rc;
 use crate::runtime::driver::Driver;
 use crate::runtime::task::{Header, JoinHandle, OwnedTasks, Runnable, Task};
 use crate::runtime::timers::Timers;
+use crate::util::Rand32;
 
 const BASE_QUEUE_CAPACITY: usize = 1024;
 
@@ -20,6 +21,7 @@ pub(crate) struct Handle {
     driver: Rc<Driver>,
     /// Shared with every armed timer, for the same reason.
     timers: Rc<Timers>,
+    rng: RefCell<Rand32>,
 }
 
 impl Handle {
@@ -29,6 +31,7 @@ impl Handle {
             owned: OwnedTasks::new(),
             driver: Rc::new(Driver::new()?),
             timers: Rc::new(Timers::new()),
+            rng: RefCell::new(Rand32::with_random_seed()),
         })
     }
 
@@ -38,6 +41,10 @@ impl Handle {
 
     pub(crate) fn timers(&self) -> &Rc<Timers> {
         &self.timers
+    }
+
+    pub(crate) fn rng(&self) -> &RefCell<Rand32> {
+        &self.rng
     }
 
     pub(crate) fn queue_is_empty(&self) -> bool {

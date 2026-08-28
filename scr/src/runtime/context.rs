@@ -75,6 +75,11 @@ pub(crate) fn timers() -> Rc<Timers> {
     with_handle(|handle| Rc::clone(handle.timers()))
 }
 
+#[track_caller]
+pub fn rand32_next_u32_below(max: u32) -> u32 {
+    with_handle(|handle| handle.rng().borrow_mut().next_u32_below(max))
+}
+
 /// Enters `handle` until the returned guard is dropped, so that spawning and
 /// waking can find it.
 pub(crate) fn enter(handle: &Handle) -> EnterGuard<'_> {
