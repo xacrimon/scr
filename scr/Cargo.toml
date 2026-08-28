@@ -1,0 +1,13 @@
+[package]
+name = "scr"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+slab = "0.4.12"
+bitflags = "2.13.1"
+libc = "0.2"
+scr-macros = { path = "../scr-macros" }

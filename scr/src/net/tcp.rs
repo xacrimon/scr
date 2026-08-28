@@ -437,6 +437,10 @@ impl AsyncWrite for TcpStream {
         Op::submit(&self.driver, sqe, Send { buf }).await
     }
 
+    async fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
+
     async fn shutdown(&self) -> io::Result<()> {
         let sqe = op::Shutdown::new()
             .fd(self.slot as i32)

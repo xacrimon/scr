@@ -1,0 +1,18 @@
+select + timer? timeouts?
+
+more time spent in runtime code vs tokio?
+coalesce timers when sleeping in reactor
+
+io uring for sock_name?
+
+expand out buf and net::tcp modules
+
+userspace timers only really work if they are checked & cancels submitted at least one batch later, started when prev batch submits? timer interaction w batching? timers that run code right away?
+
+avoid sqe & completion copies
+
+linktimeout for per-operation deadlines? connect_timeout etc
+
+better prioritization to reduce latency for e.g. tasks waiting on timers, expire timers after turn? normal vs deferrable timers
+
+avoid sqe overflow?

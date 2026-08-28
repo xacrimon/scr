@@ -45,6 +45,14 @@ pub trait AsyncWrite {
     /// remainder as `buf.slice(n..)`.
     fn write<B: IoBuf>(&self, buf: B) -> impl Future<Output = BufResult<usize, B>>;
 
+    /// Push out anything buffered on this side.
+    ///
+    /// An endpoint that submits each write straight to the kernel — every one
+    /// in this crate — has nothing to push, and this is a no-op for it. It is
+    /// here so that a buffered wrapper can be swapped in without the code
+    /// writing through it changing.
+    fn flush(&self) -> impl Future<Output = io::Result<()>>;
+
     /// Close the writing half, so the peer reads end-of-file.
     fn shutdown(&self) -> impl Future<Output = io::Result<()>>;
 }
