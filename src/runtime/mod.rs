@@ -33,7 +33,7 @@ const POLL_BUDGET: Duration = Duration::from_micros(100);
 /// `Instant::now` is a vDSO call of some twenty nanoseconds. Against a task poll
 /// that can be shorter than that, reading it every time would spend a noticeable
 /// fraction of the budget measuring the budget.
-const CLOCK_INTERVAL: u32 = 5;
+const CLOCK_INTERVAL: u32 = 10;
 
 pub struct Runtime {
     handle: Handle,
@@ -93,13 +93,6 @@ impl Runtime {
                 task.run();
                 polled += 1;
 
-                if signal.is_notified() {
-                    break;
-                }
-
-                // The submission ring filling is the measured signal that we are
-                // producing work faster than one turn per budget can drain, so
-                // go drain it now rather than waiting out the clock.
                 if driver.backlog_pending() {
                     break;
                 }

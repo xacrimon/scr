@@ -22,11 +22,6 @@
 //! published once per turn rather than once per operation: without SQPOLL the
 //! kernel only reads it inside `io_uring_enter`, so the intervening stores would
 //! be for nobody's benefit.
-//!
-//! When the ring fills, further entries go on a backlog and the executor stops
-//! polling tasks to come drain it. Under load that settles into one enter per
-//! full ring, which is the batching the ring size is for.
-
 pub(crate) mod ledger;
 pub(crate) mod op;
 
@@ -335,6 +330,11 @@ impl Driver {
     /// With `wait`, blocks until at least one completion arrives; the caller
     /// must have checked that something is actually outstanding, or it will
     /// block forever. Without it, this is a flush.
+    ///
+    /// "Submit" means queued for the kernel, not handed to it: a backlog too
+    /// small to fill the ring is left in the ring for the next call to take out.
+    /// Callers that need everything through — [`Driver::shutdown`] and the like
+    /// — already loop until nothing is outstanding, which covers it.
     pub(crate) fn turn(&self, wait: bool) -> Result<(), Errno> {
         let mut wait = wait;
 
@@ -381,14 +381,26 @@ impl Driver {
 
             self.reap();
 
+            let mut sub = self.sub.borrow_mut();
+            let backlog_after = sub.backlog.len();
+            if backlog_after == 0 {
+                return Ok(());
+            }
+
+            if backlog_after <= self.space_left(&sub) as usize / 2 {
+                self.flush_backlog(&mut sub);
+                return Ok(());
+            }
+
             // One task can fill the ring several times over in a single poll, so
             // keep going while the backlog is actually shrinking. It stops
             // shrinking when the kernel is not consuming, and then the answer is
             // to reap rather than to push harder.
-            let backlog_after = self.sub.borrow().backlog.len();
-            if backlog_after == 0 || backlog_after >= backlog_before {
+            if backlog_after >= backlog_before {
                 return Ok(());
             }
+
+            drop(sub);
             wait = false;
         }
     }
@@ -520,6 +532,34 @@ mod tests {
 
         drain(&driver);
         assert!(!driver.backlog_pending(), "the backlog drained with them");
+    }
+
+    /// Draining stops one short. The batch that fills the ring goes out, and the
+    /// remainder — being smaller than the ring — is moved into it and left
+    /// there, unsubmitted, rather than being given an `io_uring_enter` of its
+    /// own. Emptying the backlog is what lets the executor go back to producing
+    /// the entries the next turn will carry them out with.
+    #[test]
+    fn a_remainder_that_fits_the_ring_waits_for_the_next_turn() {
+        let driver = driver();
+
+        for _ in 0..12 {
+            driver.submit_detached(nop(), Box::new(Discard));
+        }
+        assert!(
+            driver.backlog_pending(),
+            "four of twelve do not fit a ring of eight"
+        );
+
+        driver.turn(false).expect("turn");
+
+        assert!(
+            !driver.backlog_pending(),
+            "the remainder moved into the ring"
+        );
+        assert_eq!(driver.in_flight(), 4, "and is sitting there, still ours");
+
+        drain(&driver);
     }
 
     /// More completions than the completion ring holds, so the kernel has to
