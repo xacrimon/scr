@@ -9,17 +9,16 @@
 //!
 //! # Telling one occupant of an entry from the next
 //!
-//! `user_data` is a [`Slab`] key and a sequence number packed into one word.
-//! A completion that arrives after its operation was cancelled and its entry
-//! reused finds a sequence number that no longer matches and is dropped,
-//! instead of being delivered to whoever holds that entry now. Without it the
-//! cancellation path would be a use-after-free waiting for the right timing.
-//!
-//! The sequence number counts *submissions*, not reuses of a particular entry,
-//! because a slab has nowhere to keep anything in a vacant entry — it only
-//! needs to differ between successive occupants, and a monotonic counter does
-//! that. It wraps after four billion operations, which would have to happen
-//! while one cancelled completion is still outstanding for it to matter.
+//! `user_data` is nothing but the [`Slab`] key, cast to a `u64` and back. That
+//! is only safe because an entry is never freed until the completion it is
+//! actually waiting for arrives — through [`Ledger::poll`] or
+//! [`Ledger::take_completed`] picking up a result, or through the `Detached`
+//! arm of [`Ledger::complete`] — so a slab index can never be handed to a new
+//! operation while the kernel might still deliver a stale one addressed to
+//! whatever used to occupy it. Cancelling an operation (see [`Ledger::detach`])
+//! does not shortcut this: the entry stays held, not freed, until the kernel's
+//! own completion for it shows up, carrying whatever result the cancellation
+//! left behind.
 
 use std::mem;
 use std::task::{LocalWaker, Poll};
@@ -65,28 +64,20 @@ impl OnComplete for Discard {
 /// A handle to one ledger entry, and the `user_data` of the operation in it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct OpKey {
-    index: u32,
-    seq: u32,
+    index: usize,
 }
 
 impl OpKey {
     /// The token to put in the SQE and read back out of the CQE.
     pub(crate) fn user_data(self) -> u64 {
-        (self.seq as u64) << 32 | self.index as u64
+        self.index as u64
     }
 
     fn from_user_data(user_data: u64) -> OpKey {
         OpKey {
-            index: user_data as u32,
-            seq: (user_data >> 32) as u32,
+            index: user_data as usize,
         }
     }
-}
-
-/// One entry, and the sequence number that says which operation is in it.
-struct Entry {
-    seq: u32,
-    state: State,
 }
 
 enum State {
@@ -103,9 +94,7 @@ enum State {
 
 /// The operation table.
 pub(crate) struct Ledger {
-    ops: Slab<Entry>,
-    /// Handed to the next operation, then incremented.
-    next_seq: u32,
+    ops: Slab<State>,
     /// Entries the kernel has yet to post a completion for.
     outstanding: u32,
 }
@@ -114,7 +103,6 @@ impl Ledger {
     pub(crate) fn with_capacity(capacity: usize) -> Ledger {
         Ledger {
             ops: Slab::with_capacity(capacity),
-            next_seq: 0,
             outstanding: 0,
         }
     }
@@ -137,15 +125,10 @@ impl Ledger {
     }
 
     fn alloc(&mut self, state: State) -> OpKey {
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
         self.outstanding += 1;
+        let index = self.ops.insert(state);
 
-        let entry = self.ops.vacant_entry();
-        let index = u32::try_from(entry.key()).expect("more than 4 billion operations in flight");
-        entry.insert(Entry { seq, state });
-
-        OpKey { index, seq }
+        OpKey { index }
     }
 
     /// Take an entry for an operation a future will wait on.
@@ -158,23 +141,22 @@ impl Ledger {
         self.alloc(State::Detached(action))
     }
 
-    /// The entry `key` names, or `None` if the completion it came from is stale.
-    fn get(&mut self, key: OpKey) -> Option<&mut Entry> {
-        self.ops
-            .get_mut(key.index as usize)
-            .filter(|entry| entry.seq == key.seq)
+    /// The entry `key` names, or `None` if it names a slot nothing occupies.
+    fn get(&mut self, key: OpKey) -> Option<&mut State> {
+        self.ops.get_mut(key.index)
     }
 
     /// Record a completion and decide what the driver should do about it.
     pub(crate) fn complete(&mut self, user_data: u64, res: i32, flags: sys::CqeFlags) -> Outcome {
         let key = OpKey::from_user_data(user_data);
-        let Some(entry) = self.get(key) else {
-            // The operation was cancelled and its entry freed or reused, or this
-            // is a completion for something that never had an entry at all.
+        let Some(state) = self.get(key) else {
+            // The operation had already been fully accounted for — its result
+            // taken, or its detached completion already delivered — or this is
+            // a completion for something that never had an entry at all.
             return Outcome::Ignore;
         };
 
-        let previous = mem::replace(&mut entry.state, State::Completed(res, flags));
+        let previous = mem::replace(state, State::Completed(res, flags));
 
         if matches!(previous, State::Completed(..)) {
             debug_assert!(false, "operation {user_data:#x} completed twice");
@@ -189,7 +171,7 @@ impl Ledger {
             State::Waiting(waker) => Outcome::Wake(waker),
             State::Detached(action) => {
                 // Nobody will ever take this result, so the entry is done with.
-                self.ops.remove(key.index as usize);
+                self.ops.remove(key.index);
                 Outcome::Detached(action, res, flags)
             }
             State::Completed(..) => unreachable!("returned above"),
@@ -198,14 +180,14 @@ impl Ledger {
 
     /// Take the result if it has arrived, and register `waker` for it if not.
     pub(crate) fn poll(&mut self, key: OpKey, waker: &LocalWaker) -> Poll<(i32, sys::CqeFlags)> {
-        let entry = self
+        let state = self
             .get(key)
             .expect("an operation was polled after its entry was freed");
 
-        match &mut entry.state {
+        match state {
             State::Completed(res, flags) => {
                 let done = (*res, *flags);
-                self.ops.remove(key.index as usize);
+                self.ops.remove(key.index);
                 Poll::Ready(done)
             }
             state => {
@@ -220,10 +202,10 @@ impl Ledger {
     /// The abandon path checks this first: an operation that finished before its
     /// future was dropped needs no detaching, and so no boxed action either.
     pub(crate) fn take_completed(&mut self, key: OpKey) -> Option<(i32, sys::CqeFlags)> {
-        let entry = self.get(key)?;
+        let state = self.get(key)?;
 
-        if let State::Completed(res, flags) = entry.state {
-            self.ops.remove(key.index as usize);
+        if let State::Completed(res, flags) = *state {
+            self.ops.remove(key.index);
             return Some((res, flags));
         }
 
@@ -237,20 +219,20 @@ impl Ledger {
     /// that never finishes on its own — a read on an idle socket — holds its
     /// entry, and whatever that entry owns, forever.
     pub(crate) fn detach(&mut self, key: OpKey, action: Box<dyn OnComplete>) {
-        let entry = self
+        let state = self
             .get(key)
             .expect("an operation was abandoned after its entry was freed");
 
         debug_assert!(
-            !matches!(entry.state, State::Completed(..)),
+            !matches!(state, State::Completed(..)),
             "detaching a finished operation discards its result"
         );
         debug_assert!(
-            !matches!(entry.state, State::Detached(_)),
+            !matches!(state, State::Detached(_)),
             "detaching twice would drop the first action, freeing what it owns"
         );
 
-        entry.state = State::Detached(action);
+        *state = State::Detached(action);
     }
 
     /// Give up on everything, for shutdown.
@@ -266,16 +248,13 @@ impl Ledger {
         let mut outstanding = Vec::new();
         let mut finished = Vec::new();
 
-        for (index, entry) in self.ops.iter_mut() {
-            match entry.state {
+        for (index, state) in self.ops.iter_mut() {
+            match state {
                 State::Completed(..) => finished.push(index),
                 State::Detached(_) => {}
                 State::Submitted | State::Waiting(_) => {
-                    entry.state = State::Detached(Box::new(Discard));
-                    outstanding.push(OpKey {
-                        index: index as u32,
-                        seq: entry.seq,
-                    });
+                    *state = State::Detached(Box::new(Discard));
+                    outstanding.push(OpKey { index });
                 }
             }
         }
@@ -299,16 +278,13 @@ mod tests {
 
     #[test]
     fn a_key_round_trips_through_user_data() {
-        let key = OpKey {
-            index: 0xdead,
-            seq: 0xbeef,
-        };
-        assert_eq!(key.user_data(), 0x0000_beef_0000_dead);
+        let key = OpKey { index: 0xdead };
+        assert_eq!(key.user_data(), 0xdead);
         assert_eq!(OpKey::from_user_data(key.user_data()), key);
     }
 
     #[test]
-    fn a_reused_entry_gets_a_new_sequence_number() {
+    fn a_freed_entry_is_reused() {
         let mut l = Ledger::with_capacity(4);
 
         let first = l.submit();
@@ -322,14 +298,10 @@ mod tests {
 
         let second = l.submit();
         assert_eq!(second.index, first.index, "the slab entry came back");
-        assert_ne!(second.seq, first.seq, "but it is a different operation");
     }
 
-    /// The whole point of the sequence number: a completion for an operation
-    /// whose entry has since been handed to somebody else must not be delivered
-    /// to the new owner.
     #[test]
-    fn a_completion_for_a_reused_entry_is_ignored() {
+    fn a_genuine_duplicate_completion_after_reuse_reaches_the_new_owner() {
         let mut l = Ledger::with_capacity(4);
 
         let stale = l.submit();
@@ -337,24 +309,25 @@ mod tests {
         l.complete(stale.user_data(), 1, flags());
 
         let fresh = l.submit();
-        assert_eq!(
-            fresh.index, stale.index,
-            "the same entry, to make the point"
-        );
+        assert_eq!(fresh.index, stale.index, "the same slot, to make the point");
 
-        // A second, late completion for the cancelled operation.
+        // A hypothetical second completion for `stale`, which io_uring's
+        // contract says should never arrive.
         assert!(matches!(
             l.complete(stale.user_data(), 7, flags()),
             Outcome::Ignore
         ));
 
-        // The new owner is untouched and still waiting for its own result.
-        let waker = noop_local_waker();
-        assert_eq!(l.poll(fresh, &waker), Poll::Pending);
+        // It landed on `fresh` instead of being recognised as stale.
+        assert_eq!(
+            l.poll(fresh, &noop_local_waker()),
+            Poll::Ready((7, flags())),
+            "the duplicate was delivered to the new owner"
+        );
     }
 
     /// A completion for an entry that was freed and *not* reused is stale too;
-    /// the slab lookup misses rather than the sequence check failing.
+    /// the slab lookup simply misses.
     #[test]
     fn a_completion_for_a_freed_entry_is_ignored() {
         let mut l = Ledger::with_capacity(4);
@@ -440,14 +413,10 @@ mod tests {
         assert_eq!(l.live(), 0);
     }
 
-    /// Churn the table and check that `live` tracks reality and that every
-    /// completion for an operation we have finished with is refused, however
-    /// many times the entry underneath it has changed hands.
     #[test]
-    fn churn_leaves_no_entry_stranded_and_no_stale_key_live() {
+    fn churn_leaves_no_entry_stranded() {
         let mut l = Ledger::with_capacity(0);
         let mut live: Vec<OpKey> = Vec::new();
-        let mut done: Vec<OpKey> = Vec::new();
         let mut state = 0x243f_6a88u32;
 
         for _ in 0..10_000 {
@@ -457,20 +426,11 @@ mod tests {
                 let key = live.swap_remove(state as usize % live.len());
                 l.complete(key.user_data(), 0, flags());
                 assert_eq!(l.poll(key, &noop_local_waker()), Poll::Ready((0, flags())));
-                done.push(key);
             } else {
                 live.push(l.submit());
             }
 
             assert_eq!(l.live() as usize, live.len());
-        }
-
-        for key in &done {
-            assert!(
-                matches!(l.complete(key.user_data(), 0, flags()), Outcome::Ignore),
-                "entry {} accepted a completion for a finished operation",
-                key.index
-            );
         }
 
         for key in live {
