@@ -26,6 +26,7 @@ pub(crate) mod ledger;
 pub(crate) mod op;
 
 use std::cell::RefCell;
+use std::cmp;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr;
@@ -54,6 +55,9 @@ const FILE_SLOTS: u32 = 1024;
 
 /// Slots left to the kernel's own allocator.
 const KERNEL_SLOTS: u32 = 256;
+
+/// The minimum amount of time the program will wait in io_uring_enter if there was no more work to do.
+const MIN_WAIT_US: u32 = 25;
 
 /// What [`Driver::turn`] should do once it has submitted what is queued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -416,9 +420,7 @@ impl Driver {
         let entered = match turn {
             Turn::Flush | Turn::Wait => {
                 // SAFETY: no argument is passed, so `arg` and `argsz` are
-                // trivially valid for these flags. Every queued entry was built
-                // by `op`, and anything it points at is owned by a ledger entry
-                // that outlives the operation — that is what detaching is for.
+                // trivially valid for these flags.
                 unsafe {
                     syscall::io_uring_enter(
                         self.ring.enter_fd(),
@@ -431,23 +433,22 @@ impl Driver {
                 }
             }
             Turn::WaitFor(timeout) => {
-                // Relative rather than `EnterFlags::ABS_TIMER`, so that nothing
-                // here depends on `Instant` being `CLOCK_MONOTONIC` — which it
-                // is on Linux, but not by any promise `std` makes.
-                let ts = sys::Timespec {
+                let mut ts = sys::Timespec {
                     tv_sec: timeout.as_secs() as i64,
                     tv_nsec: timeout.subsec_nanos() as i64,
                 };
+                if ts.tv_sec == 0 {
+                    ts.tv_nsec = cmp::max(ts.tv_nsec, MIN_WAIT_US as i64 * 1000);
+                }
                 let arg = sys::GeteventsArg {
                     sigmask: 0,
                     sigmask_sz: 0,
-                    min_wait_usec: 0,
+                    min_wait_usec: MIN_WAIT_US,
                     ts: &raw const ts as u64,
                 };
 
                 // SAFETY: `arg` is a live `GeteventsArg` for the duration of the
-                // call and `EXT_ARG` is set to say so, and the `Timespec` it
-                // points at outlives it. Submitted entries are as above.
+                // call and `EXT_ARG` is set to say so.
                 unsafe {
                     syscall::io_uring_enter(
                         self.ring.enter_fd(),
@@ -465,7 +466,7 @@ impl Driver {
             Ok(_) => Ok(()),
             // Interrupted, nothing ready, no room to post more completions, or
             // the wait timed out.
-            Err(Errno::INTR) | Err(Errno::AGAIN) | Err(Errno::BUSY) | Err(Errno::TIME) => Ok(()),
+            Err(Errno::INTR | Errno::AGAIN | Errno::BUSY | Errno::TIME) => Ok(()),
             Err(e) => Err(e),
         }
     }

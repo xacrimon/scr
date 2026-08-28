@@ -995,6 +995,43 @@ mod tests {
         assert_eq!(ring.cq().overflow(), 0);
     }
 
+    /// `min_wait_usec` only bounds a wait that also carries a `ts`. With no
+    /// timeout the kernel returns almost immediately with `ETIME` rather than
+    /// blocking, which is why [`Driver::enter`] keeps an unbounded wait on the
+    /// plain (no `EXT_ARG`) path. If a future kernel starts blocking here, this
+    /// fails and the special case can go.
+    #[test]
+    #[cfg_attr(miri, ignore = "issues real syscalls and mmaps a ring")]
+    fn min_wait_usec_without_a_timeout_does_not_block() {
+        use std::time::Instant;
+
+        let mut params = sys::Params::default();
+        let ring = Ring::with_params(8, &mut params).expect("Ring::new");
+        assert!(ring.features().contains(sys::Features::MIN_TIMEOUT));
+
+        let arg = sys::GeteventsArg {
+            sigmask: 0,
+            sigmask_sz: 0,
+            min_wait_usec: 25,
+            ts: 0,
+        };
+        let start = Instant::now();
+        // SAFETY: `arg` is live for the call; no SQEs are queued.
+        let r = unsafe {
+            syscall::io_uring_enter(
+                ring.enter_fd(),
+                0,
+                1,
+                ring.enter_flags() | sys::EnterFlags::GETEVENTS | sys::EnterFlags::EXT_ARG,
+                &raw const arg as *const std::ffi::c_void,
+                size_of::<sys::GeteventsArg>(),
+            )
+        };
+
+        assert_eq!(r, Err(Errno::TIME), "expected an immediate timeout");
+        assert!(start.elapsed().as_millis() < 100, "it blocked after all");
+    }
+
     /// Every SQ slot must map to the SQE of the same index. If the identity map
     /// were missing, all three submissions would resolve to slot 0 and come
     /// back carrying the same `user_data`.

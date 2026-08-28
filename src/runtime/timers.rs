@@ -215,7 +215,6 @@ impl Timers {
         self.inner.borrow().heap.len()
     }
 
-
     #[cfg(test)]
     pub(crate) fn entries(&self) -> usize {
         self.inner.borrow().entries.len()
