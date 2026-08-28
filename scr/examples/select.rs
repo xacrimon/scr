@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use scr::Runtime;
-use scr::time;
 use scr::select;
+use scr::time;
 use std::time::Instant;
 
 fn main() {
@@ -12,7 +12,7 @@ fn main() {
 async fn alternate() {
     let period = Duration::from_millis(500);
     let mut int1 = time::interval(period);
-    let mut int2 = time::interval_at(Instant::now()+period/2, period);
+    let mut int2 = time::interval_at(Instant::now() + period / 2, period);
 
     loop {
         select! {

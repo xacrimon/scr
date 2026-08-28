@@ -1,7 +1,7 @@
 use proc_macro::{TokenStream, TokenTree};
 use proc_macro2::Span;
 use quote::quote;
-use syn::{parse::Parser, Ident};
+use syn::{Ident, parse::Parser};
 
 pub(crate) fn declare_output_enum(input: TokenStream) -> TokenStream {
     // passed in is: `(_ _ _)` with one `_` per branch

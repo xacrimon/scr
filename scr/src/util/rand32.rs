@@ -64,7 +64,9 @@ mod tests {
 
         assert_eq!(
             output,
-            [0x00000000, 0x0c855c84, 0x452a1874, 0x126f419d, 0xb0eb774d, 0xd986ea86]
+            [
+                0x00000000, 0x0c855c84, 0x452a1874, 0x126f419d, 0xb0eb774d, 0xd986ea86
+            ]
         );
     }
 
