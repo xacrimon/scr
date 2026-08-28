@@ -392,7 +392,7 @@ impl Driver {
                 return Ok(());
             }
 
-            if backlog_after <= self.space_left(&sub) as usize / 2 {
+            if backlog_after <= self.space_left(&sub) as usize / 4 {
                 self.flush_backlog(&mut sub);
                 return Ok(());
             }
@@ -609,7 +609,7 @@ mod tests {
     fn a_remainder_that_fits_the_ring_waits_for_the_next_turn() {
         let driver = driver();
 
-        for _ in 0..12 {
+        for _ in 0..10 {
             driver.submit_detached(nop(), Box::new(Discard));
         }
         assert!(
@@ -623,7 +623,7 @@ mod tests {
             !driver.backlog_pending(),
             "the remainder moved into the ring"
         );
-        assert_eq!(driver.in_flight(), 4, "and is sitting there, still ours");
+        assert_eq!(driver.in_flight(), 2, "and is sitting there, still ours");
 
         drain(&driver);
     }
