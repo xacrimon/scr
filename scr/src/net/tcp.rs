@@ -46,8 +46,11 @@ const BACKLOG: u32 = 1024;
 /// and the slot comes back regardless, which is what lets the cleanup paths be
 /// unconditional instead of having to work out how far a chain got.
 fn close_slot(driver: &Driver, slot: u32) {
-    let sqe = op::Close::new().slot(slot).into_sqe();
-    driver.submit_detached(sqe, Box::new(FreeSlot(slot)));
+    driver.submit_detached(
+        sys::SqeFlags::empty(),
+        |s| op::prep_close_direct(s, slot),
+        Box::new(FreeSlot(slot)),
+    );
 }
 
 /// Returns a slot to the table when the close that emptied it completes.
@@ -70,16 +73,13 @@ async fn sock_name(driver: &Driver, slot: u32, peer: bool) -> io::Result<SocketA
     // truncation this protocol allows for cannot happen here.
     let (name, namelen) = addr.ptrs();
 
-    let sqe = op::UringCmd::new()
-        .fd(slot as i32)
-        .sqe_flags(|f| f | sys::SqeFlags::FIXED_FILE)
-        .cmd_op(sys::SocketOp::Getsockname as u32)
-        .sockname(name)
-        .socknamelen(namelen)
-        .peer(peer as u32)
-        .into_sqe();
-
-    Op::submit(driver, sqe, GetName { addr }).await
+    Op::submit(
+        driver,
+        sys::SqeFlags::FIXED_FILE,
+        |s| op::prep_cmd_getsockname(s, slot as i32, name, namelen, peer as u32),
+        GetName { addr },
+    )
+    .await
 }
 
 /// The payload of a [`sock_name`] command.
@@ -139,37 +139,37 @@ impl TcpListener {
         let addr_ptr = sock_addr.addr_ptr();
         let addr_len = sock_addr.len();
 
-        let chain = [
-            // The socket operation's `fd` field holds the address family, not a
-            // descriptor, and its slot is an output — so no `FIXED_FILE` here,
-            // unlike the two that follow.
-            op::Socket::new()
-                .domain(SockAddr::domain(addr))
-                .kind(libc::SOCK_STREAM as u64)
-                .protocol(0)
-                .slot(slot)
-                .sqe_flags(|f| f | sys::SqeFlags::IO_LINK)
-                .into_sqe(),
-            op::Bind::new()
-                .fd(slot as i32)
-                .addr(addr_ptr)
-                .addrlen(addr_len)
-                .sqe_flags(|f| f | sys::SqeFlags::FIXED_FILE | sys::SqeFlags::IO_LINK)
-                .into_sqe(),
-            op::Listen::new()
-                .fd(slot as i32)
-                .backlog(BACKLOG)
-                .sqe_flags(|f| f | sys::SqeFlags::FIXED_FILE)
-                .into_sqe(),
-        ];
-
         let data = BindChain {
             driver: Rc::clone(&driver),
             slot,
             _addr: sock_addr,
         };
 
-        Chain::submit(&driver, chain, data).await
+        // The socket operation's `fd` field holds the address family, not a
+        // descriptor, and its slot is an output — so no `FIXED_FILE` on it,
+        // unlike the two that follow. `submit_chain` adds the links.
+        Chain::submit(
+            &driver,
+            [
+                sys::SqeFlags::empty(),
+                sys::SqeFlags::FIXED_FILE,
+                sys::SqeFlags::FIXED_FILE,
+            ],
+            |[a, b, c]| {
+                op::prep_socket_direct(
+                    a,
+                    SockAddr::domain(addr),
+                    libc::SOCK_STREAM as u64,
+                    0,
+                    0,
+                    slot,
+                );
+                op::prep_bind(b, slot as i32, addr_ptr, addr_len);
+                op::prep_listen(c, slot as i32, BACKLOG);
+            },
+            data,
+        )
+        .await
     }
 
     /// Accept one connection.
@@ -180,12 +180,7 @@ impl TcpListener {
             .ok_or_else(|| io::Error::from_raw_os_error(libc::ENFILE))?;
 
         let mut peer = SockAddr::zeroed();
-        let sqe = op::Accept::new()
-            .fd(self.slot as i32)
-            .sqe_flags(|f| f | sys::SqeFlags::FIXED_FILE)
-            .peer(Some(peer.ptrs()))
-            .slot(slot)
-            .into_sqe();
+        let peer_ptrs = peer.ptrs();
 
         let data = AcceptOp {
             driver: Rc::clone(&self.driver),
@@ -193,7 +188,13 @@ impl TcpListener {
             peer,
         };
 
-        Op::submit(&self.driver, sqe, data).await
+        Op::submit(
+            &self.driver,
+            sys::SqeFlags::FIXED_FILE,
+            |s| op::prep_accept_direct(s, self.slot as i32, Some(peer_ptrs), 0, slot),
+            data,
+        )
+        .await
     }
 
     /// The address this listener is bound to.
@@ -333,32 +334,32 @@ impl TcpStream {
         let addr_ptr = peer.addr_ptr();
         let addr_len = peer.len();
 
-        let chain = [
-            // As in `bind`, the socket operation's `fd` field holds the address
-            // family rather than a descriptor and its slot is an output, so it
-            // takes neither `FIXED_FILE` nor the slot in `fd`.
-            op::Socket::new()
-                .domain(SockAddr::domain(addr))
-                .kind(libc::SOCK_STREAM as u64)
-                .protocol(0)
-                .slot(slot)
-                .sqe_flags(|f| f | sys::SqeFlags::IO_LINK)
-                .into_sqe(),
-            op::Connect::new()
-                .fd(slot as i32)
-                .addr(addr_ptr)
-                .addrlen(addr_len)
-                .sqe_flags(|f| f | sys::SqeFlags::FIXED_FILE)
-                .into_sqe(),
-        ];
-
         let data = ConnectChain {
             driver: Rc::clone(&driver),
             slot,
             _addr: peer,
         };
 
-        Chain::submit(&driver, chain, data).await
+        // As in `bind`, the socket operation's `fd` field holds the address
+        // family rather than a descriptor and its slot is an output, so it takes
+        // neither `FIXED_FILE` nor the slot in `fd`. `submit_chain` adds the link.
+        Chain::submit(
+            &driver,
+            [sys::SqeFlags::empty(), sys::SqeFlags::FIXED_FILE],
+            |[a, b]| {
+                op::prep_socket_direct(
+                    a,
+                    SockAddr::domain(addr),
+                    libc::SOCK_STREAM as u64,
+                    0,
+                    0,
+                    slot,
+                );
+                op::prep_connect(b, slot as i32, addr_ptr, addr_len);
+            },
+            data,
+        )
+        .await
     }
 
     fn new(driver: Rc<Driver>, slot: u32) -> TcpStream {
@@ -411,13 +412,13 @@ impl AsyncRead for TcpStream {
         let ptr = NonNull::new(buf.write_ptr()).expect("a buffer address is never null");
         let window = NonNull::slice_from_raw_parts(ptr, buf.bytes_total());
 
-        let sqe = op::Recv::new()
-            .fd(self.slot as i32)
-            .sqe_flags(|f| f | sys::SqeFlags::FIXED_FILE)
-            .buf(window)
-            .into_sqe();
-
-        Op::submit(&self.driver, sqe, Recv { buf }).await
+        Op::submit(
+            &self.driver,
+            sys::SqeFlags::FIXED_FILE,
+            |s| op::prep_recv(s, self.slot as i32, window, 0),
+            Recv { buf },
+        )
+        .await
     }
 }
 
@@ -428,13 +429,13 @@ impl AsyncWrite for TcpStream {
         let ptr = NonNull::new(buf.read_ptr().cast_mut()).expect("a buffer address is never null");
         let window = NonNull::slice_from_raw_parts(ptr, buf.bytes_init());
 
-        let sqe = op::Send::new()
-            .fd(self.slot as i32)
-            .sqe_flags(|f| f | sys::SqeFlags::FIXED_FILE)
-            .buf(window)
-            .into_sqe();
-
-        Op::submit(&self.driver, sqe, Send { buf }).await
+        Op::submit(
+            &self.driver,
+            sys::SqeFlags::FIXED_FILE,
+            |s| op::prep_send(s, self.slot as i32, window, 0),
+            Send { buf },
+        )
+        .await
     }
 
     async fn flush(&self) -> io::Result<()> {
@@ -442,13 +443,13 @@ impl AsyncWrite for TcpStream {
     }
 
     async fn shutdown(&self) -> io::Result<()> {
-        let sqe = op::Shutdown::new()
-            .fd(self.slot as i32)
-            .sqe_flags(|f| f | sys::SqeFlags::FIXED_FILE)
-            .how(libc::SHUT_WR as u32)
-            .into_sqe();
-
-        Op::submit(&self.driver, sqe, Shutdown).await
+        Op::submit(
+            &self.driver,
+            sys::SqeFlags::FIXED_FILE,
+            |s| op::prep_shutdown(s, self.slot as i32, libc::SHUT_WR as u32),
+            Shutdown,
+        )
+        .await
     }
 }
 

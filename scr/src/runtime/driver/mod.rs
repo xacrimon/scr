@@ -192,47 +192,111 @@ impl Driver {
     // -----------------------------------------------------------------------
 
     /// Submit one operation and take a ledger entry for its result.
-    pub(crate) fn submit(&self, mut sqe: sys::Sqe) -> OpKey {
+    ///
+    /// `prep` fills the reserved slot in place — see [`Driver::fill`].
+    /// `sqe_flags` is ORed onto whatever the prep function set.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn submit(
+        &self,
+        sqe_flags: sys::SqeFlags,
+        prep: impl FnOnce(uring_op::Slot<'_>),
+    ) -> OpKey {
         let key = self.ledger.borrow_mut().submit();
-        sqe.user_data = key.user_data();
-        self.push(sqe);
+        let slot = self.fill();
+        let sqe = slot.as_raw();
+        prep(slot);
+        unsafe {
+            (*sqe).flags = sqe_flags;
+            (*sqe).user_data = key.user_data();
+        }
         key
     }
 
     /// Submit a chain of linked operations, which run in order and stop at the
     /// first failure.
     ///
-    /// Every entry but the last must carry [`sys::SqeFlags::IO_LINK`] or
-    /// [`sys::SqeFlags::IO_HARDLINK`]; the chain is only a chain because of
-    /// those flags, and this keeps the whole run together on its way to the
-    /// kernel. Each member gets its own ledger entry, and each posts exactly one
-    /// completion — its own result, or `ECANCELED` once an earlier one failed.
-    pub(crate) fn submit_chain<const N: usize>(&self, mut sqes: [sys::Sqe; N]) -> [OpKey; N] {
-        debug_assert!(
-            sqes[..N - 1]
-                .iter()
-                .all(|sqe| is_linked(sqe) && !is_linked(&sqes[N - 1])),
-            "a chain is linked on every entry but the last"
+    /// `prep` fills all `N` reserved slots; this then ORs `per_entry_flags` on
+    /// and adds [`sys::SqeFlags::IO_LINK`] to every entry but the last — the
+    /// links are what make it a chain, and keeping the whole run in one
+    /// submission is what stops a dangling link head from splitting it. Each
+    /// member gets its own ledger entry and posts exactly one completion: its
+    /// own result, or `ECANCELED` once an earlier one failed.
+    pub(crate) fn submit_chain<const N: usize>(
+        &self,
+        per_entry_flags: [sys::SqeFlags; N],
+        prep: impl FnOnce([uring_op::Slot<'_>; N]),
+    ) -> [OpKey; N] {
+        assert!(
+            N <= self.ring.sq().entries() as usize,
+            "a chain of {N} does not fit a submission ring of {}",
+            self.ring.sq().entries(),
         );
 
         let keys: [OpKey; N] = {
             let mut ledger = self.ledger.borrow_mut();
             std::array::from_fn(|_| ledger.submit())
         };
-        for (sqe, key) in sqes.iter_mut().zip(keys) {
-            sqe.user_data = key.user_data();
+
+        let mut sub = self.sub.borrow_mut();
+
+        // All of it goes to the ring, or all of it to the backlog as one block —
+        // never split.
+        let contiguous = sub.backlog.is_empty() && self.space_left(&sub) as usize >= N;
+
+        let ptrs: [*mut sys::Sqe; N] = if contiguous {
+            // SAFETY: `space_left >= N`, so `tail + i` is a free slot. Each
+            // pointer derives from the same SQE array base.
+            std::array::from_fn(|i| unsafe { self.ring.sq().sqe(sub.tail.wrapping_add(i as u32)) })
+        } else {
+            for _ in 0..N {
+                sub.backlog.push_back(sys::Sqe::ZEROED);
+            }
+            let n = sub.backlog.len();
+            let mut fresh = sub.backlog.make_contiguous()[n - N..].iter_mut();
+            std::array::from_fn(|_| fresh.next().expect("N entries just pushed") as *mut sys::Sqe)
+        };
+
+        // SAFETY: each pointer names a distinct, writable slot that stays valid
+        // for this borrow.
+        prep(ptrs.map(|p| unsafe { uring_op::Slot::from_raw(p) }));
+
+        for i in 0..N {
+            let link = if i + 1 < N {
+                sys::SqeFlags::IO_LINK
+            } else {
+                sys::SqeFlags::empty()
+            };
+            // SAFETY: `prep` fully initialised each slot bar `user_data`.
+            unsafe {
+                (*ptrs[i]).flags |= per_entry_flags[i] | link;
+                (*ptrs[i]).user_data = keys[i].user_data();
+            }
         }
 
-        self.push_chain(&sqes);
+        if contiguous {
+            sub.tail = sub.tail.wrapping_add(N as u32);
+        }
+
         keys
     }
 
     /// Submit an operation nobody will wait for, with an action to run when it
     /// lands.
-    pub(crate) fn submit_detached(&self, mut sqe: sys::Sqe, action: Box<dyn OnComplete>) {
+    pub(crate) fn submit_detached(
+        &self,
+        sqe_flags: sys::SqeFlags,
+        prep: impl FnOnce(uring_op::Slot<'_>),
+        action: Box<dyn OnComplete>,
+    ) {
         let key = self.ledger.borrow_mut().submit_detached(action);
-        sqe.user_data = key.user_data();
-        self.push(sqe);
+        let slot = self.fill();
+        let sqe = slot.as_raw();
+        prep(slot);
+        unsafe {
+            (*sqe).flags = sqe_flags;
+            (*sqe).user_data = key.user_data();
+        }
     }
 
     /// Ask the kernel to stop the operation `key` names.
@@ -240,23 +304,28 @@ impl Driver {
     /// Best effort by nature: it may already have completed, in which case the
     /// cancel completes with `ENOENT` and the original result stands.
     pub(crate) fn cancel(&self, key: OpKey) {
-        let sqe = uring_op::AsyncCancel::new()
-            .target(key.user_data())
-            .into_sqe();
-        self.submit_detached(sqe, Box::new(Discard));
+        self.submit_detached(
+            sys::SqeFlags::empty(),
+            |slot| uring_op::prep_cancel(slot, key.user_data(), sys::AsyncCancelFlags::empty()),
+            Box::new(Discard),
+        );
     }
 
     /// Stop every operation still in flight on `slot`, in one entry.
     pub(crate) fn cancel_slot(&self, slot: u32) {
-        let sqe = uring_op::AsyncCancel::new()
-            .fd(slot as i32)
-            .flags(
-                sys::AsyncCancelFlags::FD
-                    | sys::AsyncCancelFlags::FD_FIXED
-                    | sys::AsyncCancelFlags::ALL,
-            )
-            .into_sqe();
-        self.submit_detached(sqe, Box::new(Discard));
+        self.submit_detached(
+            sys::SqeFlags::empty(),
+            |s| {
+                uring_op::prep_cancel_fd(
+                    s,
+                    slot as i32,
+                    sys::AsyncCancelFlags::FD
+                        | sys::AsyncCancelFlags::FD_FIXED
+                        | sys::AsyncCancelFlags::ALL,
+                )
+            },
+            Box::new(Discard),
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -286,45 +355,31 @@ impl Driver {
         self.ledger.borrow_mut().detach(key, action);
     }
 
-    fn push(&self, sqe: sys::Sqe) {
-        let mut sub = self.sub.borrow_mut();
-        self.write(&mut sub, sqe);
-    }
-
-    fn push_chain(&self, sqes: &[sys::Sqe]) {
-        assert!(
-            sqes.len() <= self.ring.sq().entries() as usize,
-            "a chain of {} does not fit a submission ring of {}",
-            sqes.len(),
-            self.ring.sq().entries()
-        );
-
-        let mut sub = self.sub.borrow_mut();
-        if sub.backlog.is_empty() && self.space_left(&sub) as usize >= sqes.len() {
-            for &sqe in sqes {
-                self.write(&mut sub, sqe);
-            }
-        } else {
-            // As a block, so that the drain can recognise it as one.
-            sub.backlog.extend(sqes.iter().copied());
-        }
-    }
-
-    /// Write one entry, into the ring if it fits and onto the backlog if not.
+    /// Reserve a submission slot and let `prep` build the entry in it.
     ///
-    /// Once anything is on the backlog everything goes there, or later
-    /// submissions would overtake the ones already waiting.
-    fn write(&self, sub: &mut Submission, sqe: sys::Sqe) {
-        if !sub.backlog.is_empty() || self.space_left(sub) == 0 {
-            sub.backlog.push_back(sqe);
-            return;
+    /// The slot is in the entry's final home — a ring slot while there is room,
+    /// a fresh backlog slot once the ring is full or the backlog is non-empty —
+    /// so the SQE is constructed once, where it stays. `prep` initialises the
+    /// whole entry bar `user_data`; this then ORs `sqe_flags` on and stamps
+    /// `user_data`. `prep` must not re-enter the driver: the submission ring is
+    /// borrowed for the duration.
+    fn fill(&self) -> uring_op::Slot<'_> {
+        let mut sub = self.sub.borrow_mut();
+
+        if !sub.backlog.is_empty() || self.space_left(&sub) == 0 {
+            sub.backlog.push_back(sys::Sqe::ZEROED);
+            let ptr = sub.backlog.back_mut().expect("just pushed") as *mut sys::Sqe;
+            let slot = unsafe { uring_op::Slot::from_raw(ptr) };
+            return slot;
         }
 
         // SAFETY: `space_left` is computed against the kernel's head, so this
         // slot is at or above the last published tail and not one the kernel is
         // reading.
-        unsafe { self.ring.sq().sqe(sub.tail).write(sqe) };
+        let ptr = unsafe { self.ring.sq().sqe(sub.tail) };
+        let slot = unsafe { uring_op::Slot::from_raw(ptr) };
         sub.tail = sub.tail.wrapping_add(1);
+        slot
     }
 
     /// Room in the ring, measured against our unpublished tail rather than the
@@ -559,13 +614,21 @@ mod tests {
     use super::*;
 
     fn nop() -> sys::Sqe {
-        uring_op::Nop::new().into_sqe()
+        let mut sqe = sys::Sqe::ZEROED;
+        // SAFETY: `sqe` outlives the slot.
+        uring_op::prep_nop(unsafe { uring_op::Slot::from_raw(&mut sqe) });
+        sqe
     }
 
     fn linked_nop() -> sys::Sqe {
-        uring_op::Nop::new()
-            .sqe_flags(|f| f | sys::SqeFlags::IO_LINK)
-            .into_sqe()
+        let mut sqe = nop();
+        sqe.flags |= sys::SqeFlags::IO_LINK;
+        sqe
+    }
+
+    /// Fill a slot with a `Nop`, for the submit paths that take a prep closure.
+    fn prep_nop(slot: uring_op::Slot<'_>) {
+        uring_op::prep_nop(slot);
     }
 
     /// A small ring, so the paths that only open up under pressure are the
@@ -587,7 +650,7 @@ mod tests {
         const N: u32 = 100;
 
         for _ in 0..N {
-            driver.submit_detached(nop(), Box::new(Discard));
+            driver.submit_detached(sys::SqeFlags::empty(), prep_nop, Box::new(Discard));
         }
 
         assert_eq!(driver.in_flight(), N);
@@ -610,7 +673,7 @@ mod tests {
         let driver = driver();
 
         for _ in 0..10 {
-            driver.submit_detached(nop(), Box::new(Discard));
+            driver.submit_detached(sys::SqeFlags::empty(), prep_nop, Box::new(Discard));
         }
         assert!(
             driver.backlog_pending(),
@@ -636,7 +699,7 @@ mod tests {
         const N: u32 = 200;
 
         for _ in 0..N {
-            driver.submit_detached(nop(), Box::new(Discard));
+            driver.submit_detached(sys::SqeFlags::empty(), prep_nop, Box::new(Discard));
         }
         drain(&driver);
 
@@ -652,11 +715,15 @@ mod tests {
 
         // Six of eight slots taken, so three will not fit.
         for _ in 0..6 {
-            driver.submit_detached(nop(), Box::new(Discard));
+            driver.submit_detached(sys::SqeFlags::empty(), prep_nop, Box::new(Discard));
         }
         assert!(!driver.backlog_pending(), "six of eight fit");
 
-        let keys = driver.submit_chain([linked_nop(), linked_nop(), nop()]);
+        let keys = driver.submit_chain([sys::SqeFlags::empty(); 3], |[a, b, c]| {
+            prep_nop(a);
+            prep_nop(b);
+            prep_nop(c);
+        });
         assert!(
             driver.backlog_pending(),
             "the chain went to the backlog whole rather than filling the last two slots"

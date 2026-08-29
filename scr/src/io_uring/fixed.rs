@@ -3,13 +3,8 @@
 //! A direct descriptor is an index into a table registered with the ring rather
 //! than a process-wide file descriptor. An operation reaches one by putting the
 //! index in [`sys::Sqe::fd`](super::sys::Sqe::fd) and setting
-//! [`sys::SqeFlags::FIXED_FILE`](super::sys::SqeFlags::FIXED_FILE):
-//!
-//! ```ignore
-//! op::Read::new()
-//!     .fd(slot as i32)
-//!     .sqe_flags(|f| f | sys::SqeFlags::FIXED_FILE)
-//! ```
+//! [`sys::SqeFlags::FIXED_FILE`](super::sys::SqeFlags::FIXED_FILE) — the `fd`
+//! argument to a `prep_` function, with the flag applied by the submission path.
 //!
 //! The point is what the kernel skips. A descriptor argument costs an
 //! `fdget`/`fdput` pair per operation — a lookup in the process file table plus
@@ -31,10 +26,9 @@
 //!
 //! # Two ways to pick a slot
 //!
-//! The kernel can choose: an operation that installs a descriptor
-//! ([`Openat`](super::op::Openat), [`Accept`](super::op::Accept),
-//! [`Socket`](super::op::Socket)) accepts [`sys::FILE_INDEX_ALLOC`](super::sys::FILE_INDEX_ALLOC) as its
-//! output slot and reports the slot it took in `cqe.res`.
+//! The kernel can choose: an operation that installs a descriptor (`openat`,
+//! `accept`, `socket`) accepts [`sys::FILE_INDEX_ALLOC`](super::sys::FILE_INDEX_ALLOC)
+//! as its output slot and reports the slot it took in `cqe.res`.
 //!
 //! Or the caller can: the same operations take a specific slot, and
 //! [`Ring::update_files`] installs an existing descriptor into one.
@@ -75,7 +69,7 @@
 //!
 //! A slot is in use from the moment an operation naming it is submitted until
 //! the completion of the operation that empties it. Closing is asynchronous —
-//! [`Close::slot`](super::op::Close::slot) — so a slot must go back to the
+//! a direct `Close` — so a slot must go back to the
 //! allocator when that close completes, never when it is submitted. Reusing it
 //! earlier hands the next operation a descriptor that is still open, and because
 //! installing into an occupied slot *replaces* the occupant instead of failing,
@@ -267,7 +261,7 @@ impl FixedFiles {
     /// Empty `slot` and return it to the allocator.
     ///
     /// The synchronous counterpart to [`FixedFiles::install`]. A reactor with a
-    /// ring to hand should prefer [`Close::slot`](super::op::Close::slot), which
+    /// ring to hand should prefer a direct `Close`, which
     /// does the same thing without leaving the submission path.
     pub fn remove(&mut self, ring: &Ring, slot: u32) -> Result<(), Errno> {
         ring.update_files(slot, &[-1])?;
@@ -291,12 +285,15 @@ mod tests {
     use crate::io_uring::sys;
     use crate::io_uring::syscall;
 
-    /// Submit one entry, wait for its completion, and report the result.
-    fn run(ring: &Ring, sqe: sys::Sqe) -> CqeResult {
+    /// Submit one entry with `flags`, wait for its completion, report the result.
+    fn run(ring: &Ring, flags: sys::SqeFlags, prep: impl FnOnce(op::Slot<'_>)) -> CqeResult {
         let sq = ring.sq();
         let tail = sq.tail();
         // SAFETY: the ring is idle in these tests, so this slot is ours.
-        unsafe { sq.sqe(tail).write(sqe) };
+        let ptr = unsafe { sq.sqe(tail) };
+        prep(unsafe { op::Slot::from_raw(ptr) });
+        // SAFETY: `prep` initialised the entry.
+        unsafe { (*ptr).flags |= flags };
         sq.set_tail(tail + 1);
 
         // SAFETY: no argument is passed, and every SQE these tests build names
@@ -468,13 +465,17 @@ mod tests {
         assert_eq!(unsafe { libc::write(w, MSG.as_ptr().cast(), MSG.len()) }, 5);
 
         let mut got = [0u8; 5];
-        let sqe = op::Read::new()
-            .fd(slot as i32)
-            .sqe_flags(|f| f | sys::SqeFlags::FIXED_FILE)
-            .buf(NonNull::from(&mut got))
-            .offset(!0)
-            .into_sqe();
-        assert_eq!(run(&ring, sqe), CqeResult::Value(5));
+        let gbuf = NonNull::from(&mut got);
+        assert_eq!(
+            run(&ring, sys::SqeFlags::FIXED_FILE, |s| op::prep_read(
+                s,
+                slot as i32,
+                gbuf,
+                !0,
+                0
+            )),
+            CqeResult::Value(5)
+        );
         assert_eq!(&got, &MSG);
 
         files.remove(&ring, slot).expect("remove");
@@ -497,12 +498,13 @@ mod tests {
         FixedFiles::register(&ring, 8, 0).expect("register");
 
         let mut got = [0u8; 4];
-        let sqe = op::Read::new()
-            .fd(3)
-            .sqe_flags(|f| f | sys::SqeFlags::FIXED_FILE)
-            .buf(NonNull::from(&mut got))
-            .into_sqe();
-        assert_eq!(run(&ring, sqe), CqeResult::Error(Errno(libc::EBADF)));
+        let gbuf = NonNull::from(&mut got);
+        assert_eq!(
+            run(&ring, sys::SqeFlags::FIXED_FILE, |s| op::prep_read(
+                s, 3, gbuf, 0, 0
+            )),
+            CqeResult::Error(Errno(libc::EBADF))
+        );
     }
 
     /// `FILE_INDEX_ALLOC` picks from the region handed to the kernel, which is
@@ -515,12 +517,16 @@ mod tests {
         let range = files.kernel_range().expect("a kernel region");
 
         for _ in 0..range.len() {
-            let sqe = op::Socket::new()
-                .domain(libc::AF_INET)
-                .kind(libc::SOCK_STREAM as u64)
-                .slot(sys::FILE_INDEX_ALLOC)
-                .into_sqe();
-            match run(&ring, sqe) {
+            match run(&ring, sys::SqeFlags::empty(), |s| {
+                op::prep_socket_direct(
+                    s,
+                    libc::AF_INET,
+                    libc::SOCK_STREAM as u64,
+                    0,
+                    0,
+                    sys::FILE_INDEX_ALLOC,
+                )
+            }) {
                 CqeResult::Value(slot) => assert!(
                     range.contains(&slot),
                     "kernel chose {slot}, outside {range:?}"
@@ -530,12 +536,17 @@ mod tests {
         }
 
         // Exhausted: the kernel will not spill into the managed region.
-        let sqe = op::Socket::new()
-            .domain(libc::AF_INET)
-            .kind(libc::SOCK_STREAM as u64)
-            .slot(sys::FILE_INDEX_ALLOC)
-            .into_sqe();
-        assert_eq!(run(&ring, sqe), CqeResult::Error(Errno(libc::ENFILE)));
+        assert_eq!(
+            run(&ring, sys::SqeFlags::empty(), |s| op::prep_socket_direct(
+                s,
+                libc::AF_INET,
+                libc::SOCK_STREAM as u64,
+                0,
+                0,
+                sys::FILE_INDEX_ALLOC
+            )),
+            CqeResult::Error(Errno(libc::ENFILE))
+        );
     }
 
     /// The table cannot be resized in place, which is why its capacity is a
@@ -567,19 +578,26 @@ mod tests {
         let slot = files.install(&ring, r).expect("install");
 
         assert_eq!(
-            run(&ring, op::Close::new().slot(slot).into_sqe()),
+            run(&ring, sys::SqeFlags::empty(), |s| op::prep_close_direct(
+                s, slot
+            )),
             CqeResult::Value(0)
         );
         files.free(slot);
         assert!(files.is_free(slot));
 
         let mut got = [0u8; 4];
-        let sqe = op::Read::new()
-            .fd(slot as i32)
-            .sqe_flags(|f| f | sys::SqeFlags::FIXED_FILE)
-            .buf(NonNull::from(&mut got))
-            .into_sqe();
-        assert_eq!(run(&ring, sqe), CqeResult::Error(Errno(libc::EBADF)));
+        let gbuf = NonNull::from(&mut got);
+        assert_eq!(
+            run(&ring, sys::SqeFlags::FIXED_FILE, |s| op::prep_read(
+                s,
+                slot as i32,
+                gbuf,
+                0,
+                0
+            )),
+            CqeResult::Error(Errno(libc::EBADF))
+        );
 
         // SAFETY: both ends are still ours.
         unsafe {

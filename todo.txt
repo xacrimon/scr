@@ -15,3 +15,17 @@ linktimeout for per-operation deadlines? connect_timeout etc
 better prioritization to reduce latency for e.g. tasks waiting on timers, expire timers after turn? normal vs deferrable timers
 
 avoid sqe overflow?
+
+pre-register waker in op::submit
+
+prefer to track op state + output within future, if dropped, track in ledger instead
+
+make io uring + driver more efficient? reduce lookups etc
+
+managed buffers & buffer handles instead of nonnull slices to io uring ops
+
+measure sq overflow hits
+
+chain future impl
+
+re short userspace timers and scheduling: tokio has deferred tasks

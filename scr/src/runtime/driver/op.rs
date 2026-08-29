@@ -10,6 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use crate::io_uring::op as uring_op;
 use crate::io_uring::sys;
 
 use super::Driver;
@@ -51,8 +52,13 @@ pub(crate) struct Op<'a, D: Completable> {
 }
 
 impl<'a, D: Completable> Op<'a, D> {
-    pub(crate) fn submit(driver: &'a Driver, sqe: sys::Sqe, data: D) -> Op<'a, D> {
-        let key = driver.submit(sqe);
+    pub(crate) fn submit(
+        driver: &'a Driver,
+        sqe_flags: sys::SqeFlags,
+        prep: impl FnOnce(uring_op::Slot<'_>),
+        data: D,
+    ) -> Op<'a, D> {
+        let key = driver.submit(sqe_flags, prep);
 
         Op {
             driver,
@@ -144,20 +150,24 @@ pub(crate) trait ChainCompletable<const N: usize>: Sized + Unpin + 'static {
 pub(crate) struct Chain<'a, const N: usize, D: ChainCompletable<N>> {
     driver: &'a Driver,
     keys: [OpKey; N],
-    results: [Option<i32>; N],
+    results: [i32; N],
+    collected: u8,
     data: Option<D>,
 }
 
 impl<'a, const N: usize, D: ChainCompletable<N>> Chain<'a, N, D> {
-    /// Submit `sqes` as one linked run.
-    ///
-    /// Every entry but the last must carry [`sys::SqeFlags::IO_LINK`] or
-    /// [`sys::SqeFlags::IO_HARDLINK`].
-    pub(crate) fn submit(driver: &'a Driver, sqes: [sys::Sqe; N], data: D) -> Chain<'a, N, D> {
+    /// Submit `N` linked operations as one chain.
+    pub(crate) fn submit(
+        driver: &'a Driver,
+        per_entry_flags: [sys::SqeFlags; N],
+        prep: impl FnOnce([uring_op::Slot<'_>; N]),
+        data: D,
+    ) -> Chain<'a, N, D> {
         Chain {
             driver,
-            keys: driver.submit_chain(sqes),
-            results: [None; N],
+            keys: driver.submit_chain(per_entry_flags, prep),
+            results: [0; N],
+            collected: 0,
             data: Some(data),
         }
     }
@@ -173,18 +183,18 @@ impl<const N: usize, D: ChainCompletable<N>> Future for Chain<'_, N, D> {
         // has finished, so the last member is the last to complete — if it has,
         // every earlier one has too, and if it has not, registering there is
         // enough to be woken exactly once instead of N times.
-        for i in (0..N).rev() {
-            if this.results[i].is_some() {
-                continue;
-            }
+        while (this.collected as usize) < N {
+            let i = N - 1 - this.collected as usize;
             match this.driver.poll_op(this.keys[i], cx.local_waker()) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready((res, _)) => this.results[i] = Some(res),
+                Poll::Ready((res, _)) => {
+                    this.results[i] = res;
+                    this.collected += 1;
+                }
             }
         }
 
-        let results =
-            std::array::from_fn(|i| this.results[i].expect("every member completed to get here"));
+        let results = this.results;
         let data = this
             .data
             .take()
@@ -207,7 +217,8 @@ impl<const N: usize, D: ChainCompletable<N>> Drop for Chain<'_, N, D> {
         let mut carrier: Option<usize> = None;
 
         for i in (0..N).rev() {
-            if self.results[i].is_some() || driver.take_completed(self.keys[i]).is_some() {
+            let in_hand = i >= N - self.collected as usize;
+            if in_hand || driver.take_completed(self.keys[i]).is_some() {
                 continue;
             }
             if carrier.is_none() {

@@ -12,3 +12,9 @@ bitflags = "2.13.1"
 libc = "0.2"
 scr-macros = { path = "../scr-macros" }
 getrandom = "0.4.3"
+
+# pin-project-lite = "0.2.11"
+# tracing
+# backtrace
+# signal-hook-registry
+# socket2

@@ -87,11 +87,7 @@ impl std::fmt::Display for Errno {
 impl std::error::Error for Errno {}
 
 fn libc_check_err(val: i32) -> Result<(), Errno> {
-    if val >= 0 {
-        Ok(())
-    } else {
-        Err(Errno::last())
-    }
+    if val >= 0 { Ok(()) } else { Err(Errno::last()) }
 }
 
 /// `io_uring_setup(2)`.

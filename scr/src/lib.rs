@@ -1,5 +1,4 @@
 #![feature(local_waker)]
-#![feature(macro_metavar_expr_concat)]
 
 mod io_uring;
 mod runtime;
