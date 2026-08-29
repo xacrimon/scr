@@ -12,8 +12,8 @@
 #![allow(dead_code)]
 
 use std::ffi::c_void;
-use std::io;
 use std::ptr::NonNull;
+use std::{io, ptr};
 
 use super::sys;
 
@@ -57,7 +57,8 @@ impl Errno {
 
     /// The errno most recently set by a failing libc call.
     fn last() -> Errno {
-        Errno(io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        let raw = unsafe { libc::__errno_location().read() };
+        Errno(raw)
     }
 
     pub fn raw(self) -> i32 {
@@ -93,10 +94,6 @@ fn ret(r: libc::c_long) -> Result<u32, Errno> {
         Ok(r as u32)
     }
 }
-
-// ---------------------------------------------------------------------------
-// io_uring syscalls
-// ---------------------------------------------------------------------------
 
 /// `io_uring_setup(2)`.
 ///
@@ -181,59 +178,27 @@ pub unsafe fn io_uring_register(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Memory
-// ---------------------------------------------------------------------------
-
-/// `mmap(2)`.
-///
-/// For ring segments this is `PROT_READ | PROT_WRITE` with
-/// `MAP_SHARED | MAP_POPULATE`, `fd` the ring fd, and `offset` one of the
-/// `sys::OFF_*` constants. See [`map_ring`].
-///
-/// # Safety
-///
-/// Standard `mmap` contract: the caller owns the returned mapping and must not
-/// unmap or alias it in a way that invalidates outstanding references.
-pub unsafe fn mmap(
-    addr: *mut c_void,
-    len: usize,
-    prot: i32,
-    flags: i32,
-    fd: i32,
-    offset: u64,
-) -> Result<NonNull<c_void>, Errno> {
-    // SAFETY: forwarded to the caller's contract.
-    let p = unsafe { libc::mmap(addr, len, prot, flags, fd, offset as libc::off_t) };
-    if p == libc::MAP_FAILED {
-        return Err(Errno::last());
-    }
-    // SAFETY: mmap returns either MAP_FAILED, handled above, or a non-null
-    // page-aligned mapping.
-    Ok(unsafe { NonNull::new_unchecked(p) })
-}
-
-/// [`mmap`] with the protection and flags every io_uring ring segment uses.
+/// `mmap(2)` wrapper with the protection and flags every io_uring ring segment uses.
 ///
 /// `offset` must be one of [`sys::OFF_SQ_RING`], [`sys::OFF_CQ_RING`],
 /// [`sys::OFF_SQES`], or [`sys::OFF_PBUF_RING`] OR'd with a buffer group id.
 ///
 /// # Safety
 ///
-/// As [`mmap`]. `fd` must be a live ring file descriptor and `len` must match
+/// As `fd` must be a live ring file descriptor and `len` must match
 /// the segment size implied by the ring's [`sys::Params`].
 pub unsafe fn map_ring(len: usize, fd: i32, offset: u64) -> Result<NonNull<c_void>, Errno> {
+    let prot = libc::PROT_READ | libc::PROT_WRITE;
+    let flags = libc::MAP_SHARED | libc::MAP_POPULATE;
+
     // SAFETY: forwarded to the caller's contract.
-    unsafe {
-        mmap(
-            std::ptr::null_mut(),
-            len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED | libc::MAP_POPULATE,
-            fd,
-            offset,
-        )
+    let p = unsafe { libc::mmap(ptr::null_mut(), len, prot, flags, fd, offset as libc::off_t) };
+    if p == libc::MAP_FAILED {
+        return Err(Errno::last());
     }
+
+    // SAFETY: mmap returns either MAP_FAILED or a non-null mapping.
+    Ok(unsafe { NonNull::new_unchecked(p) })
 }
 
 /// `munmap(2)`.
