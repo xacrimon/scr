@@ -29,3 +29,5 @@ measure sq overflow hits
 chain future impl
 
 re short userspace timers and scheduling: tokio has deferred tasks
+
+poll_future & drop_future vtable entries?
