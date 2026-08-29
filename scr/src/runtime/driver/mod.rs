@@ -238,47 +238,64 @@ impl Driver {
             std::array::from_fn(|_| ledger.submit())
         };
 
-        let mut sub = self.sub.borrow_mut();
-
         // All of it goes to the ring, or all of it to the backlog as one block —
-        // never split.
-        let contiguous = sub.backlog.is_empty() && self.space_left(&sub) as usize >= N;
-
-        let ptrs: [*mut sys::Sqe; N] = if contiguous {
-            // SAFETY: `space_left >= N`, so `tail + i` is a free slot. Each
-            // pointer derives from the same SQE array base.
-            std::array::from_fn(|i| unsafe { self.ring.sq().sqe(sub.tail.wrapping_add(i as u32)) })
-        } else {
-            for _ in 0..N {
-                sub.backlog.push_back(sys::Sqe::ZEROED);
-            }
-            let n = sub.backlog.len();
-            let mut fresh = sub.backlog.make_contiguous()[n - N..].iter_mut();
-            std::array::from_fn(|_| fresh.next().expect("N entries just pushed") as *mut sys::Sqe)
+        // never split, or a dangling link head at a submission boundary would
+        // become two unrelated runs.
+        let contiguous = {
+            let sub = self.sub.borrow();
+            sub.backlog.is_empty() && self.space_left(&sub) as usize >= N
         };
-
-        // SAFETY: each pointer names a distinct, writable slot that stays valid
-        // for this borrow.
-        prep(ptrs.map(|p| unsafe { uring_op::Slot::from_raw(p) }));
-
-        for i in 0..N {
-            let link = if i + 1 < N {
-                sys::SqeFlags::IO_LINK
-            } else {
-                sys::SqeFlags::empty()
-            };
-            // SAFETY: `prep` fully initialised each slot bar `user_data`.
-            unsafe {
-                (*ptrs[i]).flags |= per_entry_flags[i] | link;
-                (*ptrs[i]).user_data = keys[i].user_data();
-            }
+        if !contiguous {
+            self.backlog_chain(per_entry_flags, &keys, prep);
+            return keys;
         }
 
-        if contiguous {
-            sub.tail = sub.tail.wrapping_add(N as u32);
+        let base = {
+            let mut sub = self.sub.borrow_mut();
+            let base = sub.tail;
+            sub.tail = base.wrapping_add(N as u32);
+            base
+        };
+        // SAFETY: `space_left >= N` held just above and nothing else submits in
+        // between, so `base + i` is a free ring slot; the pointers all carry the
+        // SQE array's provenance.
+        let ptrs: [*mut sys::Sqe; N] =
+            std::array::from_fn(|i| unsafe { self.ring.sq().sqe(base.wrapping_add(i as u32)) });
+        prep(ptrs.map(|p| unsafe { uring_op::Slot::from_raw(p) }));
+        for (i, &ptr) in ptrs.iter().enumerate() {
+            // SAFETY: `prep` initialised each slot bar `user_data`.
+            chain_stamp(unsafe { &mut *ptr }, i, N, per_entry_flags[i], keys[i]);
         }
 
         keys
+    }
+
+    /// The backlog half of [`Driver::submit_chain`]. Out of line and cold: a
+    /// chain reaching the backlog means the ring was already full.
+    ///
+    /// `each_mut` hands out `N` non-aliasing `&mut` into the local block with no
+    /// borrow-stack games; the block is then appended whole, so the backlog is
+    /// never rotated.
+    #[cold]
+    #[inline(never)]
+    fn backlog_chain<const N: usize, F>(
+        &self,
+        per_entry_flags: [sys::SqeFlags; N],
+        keys: &[OpKey; N],
+        prep: F,
+    ) where
+        F: FnOnce([uring_op::Slot<'_>; N]),
+    {
+        let mut block = [const { sys::Sqe::ZEROED }; N];
+        prep(
+            block
+                .each_mut()
+                .map(|sqe| unsafe { uring_op::Slot::from_raw(sqe) }),
+        );
+        for (i, sqe) in block.iter_mut().enumerate() {
+            chain_stamp(sqe, i, N, per_entry_flags[i], keys[i]);
+        }
+        self.sub.borrow_mut().backlog.extend(block);
     }
 
     /// Submit an operation nobody will wait for, with an action to run when it
@@ -569,6 +586,19 @@ impl Driver {
 fn is_linked(sqe: &sys::Sqe) -> bool {
     sqe.flags
         .intersects(sys::SqeFlags::IO_LINK | sys::SqeFlags::IO_HARDLINK)
+}
+
+/// Stamp a chain member: its own `per_entry` flags, plus the
+/// [`sys::SqeFlags::IO_LINK`] that ties it to the next entry unless it is the
+/// last, plus its ledger token.
+fn chain_stamp(sqe: &mut sys::Sqe, i: usize, n: usize, per_entry: sys::SqeFlags, key: OpKey) {
+    let link = if i + 1 < n {
+        sys::SqeFlags::IO_LINK
+    } else {
+        sys::SqeFlags::empty()
+    };
+    sqe.flags |= per_entry | link;
+    sqe.user_data = key.user_data();
 }
 
 /// How many entries at the front of the backlog have to go out together.
