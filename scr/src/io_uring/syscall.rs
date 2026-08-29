@@ -86,12 +86,11 @@ impl std::fmt::Display for Errno {
 
 impl std::error::Error for Errno {}
 
-/// Map a `libc::syscall` return value onto the negative-errno convention.
-fn ret(r: libc::c_long) -> Result<u32, Errno> {
-    if r < 0 {
-        Err(Errno::last())
+fn libc_check_err(val: i32) -> Result<(), Errno> {
+    if val >= 0 {
+        Ok(())
     } else {
-        Ok(r as u32)
+        Err(Errno::last())
     }
 }
 
@@ -105,13 +104,16 @@ fn ret(r: libc::c_long) -> Result<u32, Errno> {
 /// not be passed to `close`.
 pub fn io_uring_setup(entries: u32, params: &mut sys::Params) -> Result<u32, Errno> {
     // SAFETY: `params` is a valid, uniquely borrowed `Params` for the call.
-    ret(unsafe {
+    let v = unsafe {
         libc::syscall(
             libc::SYS_io_uring_setup,
             entries as libc::c_long,
             params as *mut sys::Params as libc::c_long,
-        )
-    })
+        ) as i32
+    };
+
+    libc_check_err(v)?;
+    Ok(v as u32)
 }
 
 /// `io_uring_enter(2)`, submitting `to_submit` entries and optionally waiting
@@ -137,7 +139,7 @@ pub unsafe fn io_uring_enter(
     argsz: usize,
 ) -> Result<u32, Errno> {
     // SAFETY: forwarded to the caller's contract.
-    ret(unsafe {
+    let v = unsafe {
         libc::syscall(
             libc::SYS_io_uring_enter,
             fd as libc::c_long,
@@ -146,8 +148,11 @@ pub unsafe fn io_uring_enter(
             flags.bits() as libc::c_long,
             arg as libc::c_long,
             argsz as libc::c_long,
-        )
-    })
+        ) as i32
+    };
+
+    libc_check_err(v)?;
+    Ok(v as u32)
 }
 
 /// `io_uring_register(2)`.
@@ -167,15 +172,18 @@ pub unsafe fn io_uring_register(
     nr_args: u32,
 ) -> Result<u32, Errno> {
     // SAFETY: forwarded to the caller's contract.
-    ret(unsafe {
+    let v = unsafe {
         libc::syscall(
             libc::SYS_io_uring_register,
             fd as libc::c_long,
             op as libc::c_long,
             arg as libc::c_long,
             nr_args as libc::c_long,
-        )
-    })
+        ) as i32
+    };
+
+    libc_check_err(v)?;
+    Ok(v as u32)
 }
 
 /// `mmap(2)` wrapper with the protection and flags every io_uring ring segment uses.
@@ -209,10 +217,8 @@ pub unsafe fn map_ring(len: usize, fd: i32, offset: u64) -> Result<NonNull<c_voi
 /// may reference it afterwards.
 pub unsafe fn munmap(addr: NonNull<c_void>, len: usize) -> Result<(), Errno> {
     // SAFETY: forwarded to the caller's contract.
-    if unsafe { libc::munmap(addr.as_ptr(), len) } < 0 {
-        return Err(Errno::last());
-    }
-    Ok(())
+    let v = unsafe { libc::munmap(addr.as_ptr(), len) };
+    libc_check_err(v)
 }
 
 /// `close(2)`.
@@ -224,10 +230,8 @@ pub unsafe fn munmap(addr: NonNull<c_void>, len: usize) -> Result<(), Errno> {
 /// index, not a descriptor, and must not be passed here.
 pub unsafe fn close(fd: i32) -> Result<(), Errno> {
     // SAFETY: forwarded to the caller's contract.
-    if unsafe { libc::close(fd) } < 0 {
-        return Err(Errno::last());
-    }
-    Ok(())
+    let v = unsafe { libc::close(fd) };
+    libc_check_err(v)
 }
 
 #[cfg(test)]
