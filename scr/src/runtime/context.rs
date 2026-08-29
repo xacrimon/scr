@@ -38,7 +38,10 @@ thread_local! {
 /// entered, which the runtime is for the whole of `block_on`, `spawn` and its
 /// own shutdown.
 #[track_caller]
-pub(crate) fn with_handle<T>(f: impl FnOnce(&Handle) -> T) -> T {
+pub(crate) fn with_handle<F, T>(f: F) -> T
+where
+    F: FnOnce(&Handle) -> T,
+{
     let handle = CONTEXT
         .with(|ctx| ctx.handle.get())
         .expect("called from outside of a runtime");

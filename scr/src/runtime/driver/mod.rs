@@ -195,13 +195,10 @@ impl Driver {
     ///
     /// `prep` fills the reserved slot in place — see [`Driver::fill`].
     /// `sqe_flags` is ORed onto whatever the prep function set.
-    #[cold]
-    #[inline(never)]
-    pub(crate) fn submit(
-        &self,
-        sqe_flags: sys::SqeFlags,
-        prep: impl FnOnce(uring_op::Slot<'_>),
-    ) -> OpKey {
+    pub(crate) fn submit<F>(&self, sqe_flags: sys::SqeFlags, prep: F) -> OpKey
+    where
+        F: FnOnce(uring_op::Slot<'_>),
+    {
         let key = self.ledger.borrow_mut().submit();
         let slot = self.fill();
         let sqe = slot.as_raw();
@@ -222,11 +219,14 @@ impl Driver {
     /// submission is what stops a dangling link head from splitting it. Each
     /// member gets its own ledger entry and posts exactly one completion: its
     /// own result, or `ECANCELED` once an earlier one failed.
-    pub(crate) fn submit_chain<const N: usize>(
+    pub(crate) fn submit_chain<const N: usize, F>(
         &self,
         per_entry_flags: [sys::SqeFlags; N],
-        prep: impl FnOnce([uring_op::Slot<'_>; N]),
-    ) -> [OpKey; N] {
+        prep: F,
+    ) -> [OpKey; N]
+    where
+        F: FnOnce([uring_op::Slot<'_>; N]),
+    {
         assert!(
             N <= self.ring.sq().entries() as usize,
             "a chain of {N} does not fit a submission ring of {}",
