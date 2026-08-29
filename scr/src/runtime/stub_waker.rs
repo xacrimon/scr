@@ -1,11 +1,12 @@
 use std::ptr;
 use std::task::{RawWaker, RawWakerVTable, Waker};
 
-pub(super) fn stub_waker() -> Waker {
-    unsafe { Waker::from_raw(raw_stub_waker()) }
+pub(super) fn stub_waker() -> &'static Waker {
+    static WAKER: Waker = unsafe { Waker::from_raw(raw_stub_waker()) };
+    &WAKER
 }
 
-fn raw_stub_waker() -> RawWaker {
+const fn raw_stub_waker() -> RawWaker {
     RawWaker::new(ptr::null(), &VTABLE)
 }
 

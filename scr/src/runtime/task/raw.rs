@@ -219,7 +219,7 @@ unsafe fn poll<T: Future<Output = ()>>(ptr: NonNull<Header>) {
         TransitionToRunning::Polled => {
             let local_waker = unsafe { waker_ref(&raw) };
             let waker = stub_waker();
-            let cx = ContextBuilder::from_waker(&waker)
+            let cx = ContextBuilder::from_waker(waker)
                 .local_waker(&local_waker)
                 .build();
 

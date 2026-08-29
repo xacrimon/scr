@@ -62,7 +62,7 @@ impl Runtime {
         let signal = blocked_on::Signal::new();
         let waker = stub_waker();
         let local_waker = signal.waker();
-        let mut cx = ContextBuilder::from_waker(&waker)
+        let mut cx = ContextBuilder::from_waker(waker)
             .local_waker(&local_waker)
             .build();
 
