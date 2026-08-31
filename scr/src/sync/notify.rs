@@ -5,7 +5,6 @@ use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Relaxed, Release};
 use std::task::{Context, LocalWaker, Poll};
 use std::{assert_matches, mem};
 
@@ -520,7 +519,7 @@ impl NotifiedProject<'_> {
                     let mut old_waker = None;
                     if waker.is_some() {
                         unsafe {
-                            old_waker = mem::replace((&mut *waiter.waker.get()), waker);
+                            old_waker = mem::replace(&mut *waiter.waker.get(), waker);
                         }
                     }
 
