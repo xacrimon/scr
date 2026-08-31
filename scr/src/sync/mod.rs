@@ -15,3 +15,5 @@ mod once_cell; // TODO // TODO
 
 //mod mutex;
 //mod rwlock;
+
+pub use notify::{Notified, Notify, OwnedNotified};
