@@ -1,3 +1,4 @@
+mod linked_list;
 mod rand32;
 mod sync_wrapper;
 
