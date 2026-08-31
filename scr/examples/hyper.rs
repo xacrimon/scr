@@ -72,13 +72,7 @@ use scr::io::{AsyncRead, AsyncWrite};
 use scr::net::TcpListener;
 use scr::{Runtime, spawn};
 
-/// How much a connection asks the ring for at a time, and so the memory an idle
-/// connection costs on the read side.
 const CONN_BUF_SIZE: usize = 4 * 1024;
-
-/// How long a connection may take to send its request head before it is dropped.
-/// Only here to give [`ScrTimer`] something to do — without it hyper never asks
-/// the runtime for a timer at all.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn main() -> io::Result<()> {
