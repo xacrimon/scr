@@ -95,28 +95,23 @@ impl Drop for NotifyWaitersList<'_> {
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct Notified<'a> {
     notify: &'a Notify,
-    state: State,
+    state: NotifiedState,
     notify_waiters_calls: usize,
     waiter: Waiter,
 }
-
-unsafe impl<'a> Send for Notified<'a> {}
-unsafe impl<'a> Sync for Notified<'a> {}
 
 #[derive(Debug)]
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct OwnedNotified {
     notify: Rc<Notify>,
-    state: State,
+    state: NotifiedState,
     notify_waiters_calls: usize,
     waiter: Waiter,
 }
 
-unsafe impl Sync for OwnedNotified {}
-
 struct NotifiedProject<'a> {
     notify: &'a Notify,
-    state: &'a mut State,
+    state: &'a mut NotifiedState,
     notify_waiters_calls: &'a usize,
     waiter: &'a Waiter,
 }
@@ -134,6 +129,13 @@ enum Phase {
     Notified,
 }
 
+#[derive(Debug)]
+enum NotifiedState {
+    Init,
+    Waiting,
+    Done,
+}
+
 impl Notify {
     pub const fn new() -> Notify {
         Self {
@@ -146,23 +148,21 @@ impl Notify {
     }
 
     pub fn notified(&self) -> Notified<'_> {
-        let state = self.state.get();
-
         Notified {
             notify: self,
-            state,
-            notify_waiters_calls: state.notify_waiters_calls,
+            state: NotifiedState::Init,
+            notify_waiters_calls: self.state.get().notify_waiters_calls,
             waiter: Waiter::new(),
         }
     }
 
     pub fn notified_owned(self: Rc<Self>) -> OwnedNotified {
-        let state = self.state.get();
+        let notify_waiters_calls = self.state.get().notify_waiters_calls;
 
         OwnedNotified {
             notify: self,
-            state,
-            notify_waiters_calls: state.notify_waiters_calls,
+            state: NotifiedState::Init,
+            notify_waiters_calls,
             waiter: Waiter::new(),
         }
     }
@@ -322,7 +322,7 @@ impl Notified<'_> {
     fn project(self: Pin<&mut Self>) -> NotifiedProject<'_> {
         unsafe {
             is_unpin::<&Notify>();
-            is_unpin::<State>();
+            is_unpin::<NotifiedState>();
             is_unpin::<usize>();
 
             let me = self.get_unchecked_mut();
@@ -364,7 +364,7 @@ impl OwnedNotified {
     fn project(self: Pin<&mut Self>) -> NotifiedProject<'_> {
         unsafe {
             is_unpin::<&Notify>();
-            is_unpin::<State>();
+            is_unpin::<NotifiedState>();
             is_unpin::<usize>();
 
             let me = self.get_unchecked_mut();
@@ -422,12 +422,12 @@ impl NotifiedProject<'_> {
         } = self;
 
         'outer_loop: loop {
-            match state.phase {
-                Phase::Empty => {
+            match *state {
+                NotifiedState::Init => {
                     let curr = notify.state.get();
 
                     if curr.notify_waiters_calls != *notify_waiters_calls {
-                        state.phase = Phase::Notified;
+                        *state = NotifiedState::Done;
                         continue 'outer_loop;
                     }
 
@@ -442,7 +442,7 @@ impl NotifiedProject<'_> {
                     let res = cell_cas(&notify.state, cas_curr, cas_new);
 
                     if res.is_ok() {
-                        state.phase = Phase::Notified;
+                        *state = NotifiedState::Done;
                         continue 'outer_loop;
                     }
 
@@ -453,7 +453,7 @@ impl NotifiedProject<'_> {
                     let mut curr = notify.state.get();
 
                     if curr.notify_waiters_calls != *notify_waiters_calls {
-                        state.phase = Phase::Notified;
+                        *state = NotifiedState::Done;
                         continue 'outer_loop;
                     }
 
@@ -493,7 +493,7 @@ impl NotifiedProject<'_> {
 
                                 match res {
                                     Ok(()) => {
-                                        state.phase = Phase::Notified;
+                                        *state = NotifiedState::Done;
                                         continue 'outer_loop;
                                     }
                                     Err(actual) => {
@@ -514,19 +514,19 @@ impl NotifiedProject<'_> {
 
                     waiters.push_front(NonNull::from(waiter));
 
-                    state.phase = Phase::Waiting;
+                    *state = NotifiedState::Waiting;
 
                     drop(waiters);
                     drop(old_waker);
 
                     return Poll::Pending;
                 }
-                Phase::Waiting => {
+                NotifiedState::Waiting => {
                     if waiter.notification.get().is_some() {
                         drop(unsafe { (*waiter.waker.get()).take() });
 
                         waiter.notification.set(None);
-                        state.phase = Phase::Notified;
+                        *state = NotifiedState::Done;
                         return Poll::Ready(());
                     }
 
@@ -541,7 +541,7 @@ impl NotifiedProject<'_> {
                         drop(waiters);
                         drop(old_waker);
 
-                        state.phase = Phase::Notified;
+                        *state = NotifiedState::Done;
                         return Poll::Ready(());
                     }
 
@@ -552,7 +552,7 @@ impl NotifiedProject<'_> {
 
                         unsafe { waiters.remove(NonNull::from(waiter)) };
 
-                        state.phase = Phase::Notified;
+                        *state = NotifiedState::Done;
                     } else {
                         unsafe {
                             let v = &mut *waiter.waker.get();
@@ -577,7 +577,7 @@ impl NotifiedProject<'_> {
 
                     drop(old_waker);
                 }
-                Phase::Notified => {
+                NotifiedState::Done => {
                     return Poll::Ready(());
                 }
             }
@@ -592,7 +592,7 @@ impl NotifiedProject<'_> {
             ..
         } = self;
 
-        if matches!(state.phase, Phase::Waiting) {
+        if matches!(*state, NotifiedState::Waiting) {
             let mut waiters = notify.waiters.borrow_mut();
             let mut notify_state = notify.state.get();
 
