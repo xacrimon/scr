@@ -13,6 +13,9 @@ libc = "0.2"
 scr-macros = { path = "../scr-macros" }
 getrandom = "0.4.3"
 
+[dev-dependencies]
+hyper = { version = "1.11.1", default-features = false, features = ["server", "http1"] }
+
 # pin-project-lite = "0.2.11"
 # tracing
 # backtrace
