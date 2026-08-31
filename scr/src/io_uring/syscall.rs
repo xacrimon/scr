@@ -87,12 +87,9 @@ impl std::fmt::Display for Errno {
 impl std::error::Error for Errno {}
 
 macro_rules! libc_try {
-    ($i:ident) => {
-        libc_try!($i, < 0)
-    };
+    ($i:ident) => { libc_try!($i, < 0) };
     ($i:ident, $($cmp_rhs:tt)*) => {
         if $i $($cmp_rhs)* {
-            hint::cold_path();
             return Err(Errno::last());
         }
     };
