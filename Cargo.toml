@@ -1,5 +1,5 @@
 [workspace]
-members = ["scr", "scr-macros"]
+members = ["scr", "scr-macros", "scr-test"]
 resolver = "3"
 
 [workspace.package]

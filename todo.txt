@@ -33,3 +33,13 @@ re short userspace timers and scheduling: tokio has deferred tasks
 poll_future & drop_future vtable entries?
 
 seperate futures module for e.g. named futures like ownednotified?
+
+https://github.com/tokio-rs/tokio/issues/8240
+
+https://github.com/frostyplanet/crossfire-rs
+
+more performant notify and atomicwaker?
+
+docs, lint configs. warn missing docs, missing debugs, idioms etc
+
+deps, workspace & crate cargo.toml

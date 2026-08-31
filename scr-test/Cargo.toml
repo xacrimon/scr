@@ -1,0 +1,10 @@
+[package]
+name = "scr-test"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+scr = { path = "../scr" }
+
+[lints]
+workspace = true

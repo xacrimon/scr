@@ -16,4 +16,7 @@ mod once_cell; // TODO // TODO
 //mod mutex;
 //mod rwlock;
 
+#[cfg(test)]
+mod tests;
+
 pub use notify::{Notified, Notify, OwnedNotified};

@@ -38,7 +38,6 @@ impl Waiter {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(usize)]
 enum NotifyOneStrategy {
     Fifo,
     Lifo,
@@ -432,16 +431,6 @@ impl NotifiedProject<'_> {
                         continue 'outer_loop;
                     }
 
-                    //let mut ok = true;
-                    //notify.state.update(|mut acc| {
-                    //    if matches!(acc.phase, Phase::Notified) {
-                    //        ok = false;
-                    //        return acc;
-                    //    }
-                    //
-                    //    acc.phase = Phase::Empty;
-                    //    acc
-                    //});
                     let cas_curr = State {
                         phase: Phase::Notified,
                         notify_waiters_calls: curr.notify_waiters_calls,
