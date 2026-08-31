@@ -150,7 +150,7 @@ impl Notify {
         let state = self.state.get();
 
         Notified {
-            notify: &self,
+            notify: self,
             state,
             notify_waiters_calls: state.notify_waiters_calls,
             waiter: Waiter::new(),
@@ -179,7 +179,7 @@ impl Notify {
     fn notify_with_strategy(&self, strategy: NotifyOneStrategy) {
         let mut curr = self.state.get();
 
-        while matches!(curr.phase, Phase::Empty | Phase::Notified) {
+        if matches!(curr.phase, Phase::Empty | Phase::Notified) {
             curr.phase = Phase::Notified;
             self.state.set(curr);
             return;
@@ -616,13 +616,12 @@ impl NotifiedProject<'_> {
                 notify.state.set(notify_state);
             }
 
-            if let Some(Notification::One(strategy)) = notification {
-                if let Some(waker) =
+            if let Some(Notification::One(strategy)) = notification
+                && let Some(waker) =
                     notify_locked(&mut waiters, &notify.state, notify_state, strategy)
-                {
-                    drop(waiters);
-                    waker.wake();
-                }
+            {
+                drop(waiters);
+                waker.wake();
             }
         }
     }
