@@ -13,7 +13,7 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::{io, ptr};
+use std::{hint, io, ptr};
 
 use super::sys;
 
@@ -87,8 +87,15 @@ impl std::fmt::Display for Errno {
 impl std::error::Error for Errno {}
 
 macro_rules! libc_try {
-    ($i:ident) => { libc_try!($i, < 0) };
-    ($i:ident, $($cmp_rhs:tt)*) => { if $i $($cmp_rhs)* { return Err(Errno::last()) } };
+    ($i:ident) => {
+        libc_try!($i, < 0)
+    };
+    ($i:ident, $($cmp_rhs:tt)*) => {
+        if $i $($cmp_rhs)* {
+            hint::cold_path();
+            return Err(Errno::last());
+        }
+    };
 }
 
 /// `io_uring_setup(2)`.
