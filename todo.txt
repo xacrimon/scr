@@ -43,3 +43,20 @@ more performant notify and atomicwaker?
 docs, lint configs. warn missing docs, missing debugs, idioms etc
 
 deps, workspace & crate cargo.toml
+
+glommio-style task latency requirements etc? task queues?
+
+communication between multiple executors?
+
+glommio channel & sync primitives
+
+https://docs.rs/glommio/latest/glommio/controllers/index.html
+
+apis like joinset, taskset/tasktracker, cancellationtoken etc
+
+finish sync + channel apis:
+- broadcast
+- watch
+- barrier
+- mutex
+- rwlock
