@@ -147,12 +147,13 @@ macro_rules! prep {
         $( $arg:ident : $argty:ty => $( $slot:ident $(= $conv:expr)? ),+ ; )*
     ) => {
         $(#[$doc])*
-        #[allow(dead_code)]
-        pub(crate) fn $fn(dst: Slot<'_>, $($arg: $argty),*) {
+        #[allow(dead_code, clippy::too_many_arguments)]
+        pub(crate) fn $fn(dst: Slot<'_>, sqe_flags: impl Into<Option<sys::SqeFlags>>, $($arg: $argty),*) {
             let mut sqe = sys::Sqe::ZEROED;
             sqe.opcode = sys::Opcode::$op;
             $( sqe.$pk = $pv; )*
             $( $( sqe.$slot = prep!(@conv $arg $(, $conv)?); )+ )*
+            if let Some(sqe_flags) = sqe_flags.into() { sqe.flags ^= sqe_flags };
             dst.fill(sqe);
         }
     };
@@ -935,7 +936,7 @@ mod tests {
     fn read_encodes_like_prep_rw() {
         let mut store = [0u8; 64];
         let buf = buf_of(&mut store);
-        let sqe = built(|s| prep_read(s, 5, buf, 9, 0));
+        let sqe = built(|s| prep_read(s, None, 5, buf, 9, 0));
 
         assert_eq!(sqe.opcode, sys::Opcode::Read);
         assert_eq!(sqe.fd, 5);
@@ -963,33 +964,33 @@ mod tests {
     fn kernel_required_presets() {
         let ts = NonNull::dangling();
         assert_eq!(
-            built(|s| prep_timeout(s, ts, 0, sys::TimeoutFlags::empty())).len,
+            built(|s| prep_timeout(s, None, ts, 0, sys::TimeoutFlags::empty())).len,
             1
         );
         assert_eq!(
-            built(|s| prep_timeout(s, ts, 0, sys::TimeoutFlags::empty())).fd,
+            built(|s| prep_timeout(s, None, ts, 0, sys::TimeoutFlags::empty())).fd,
             -1
         );
         assert_eq!(
-            built(|s| prep_link_timeout(s, ts, sys::TimeoutFlags::empty())).len,
+            built(|s| prep_link_timeout(s, None, ts, sys::TimeoutFlags::empty())).len,
             1
         );
 
         let msg = NonNull::dangling();
-        assert_eq!(built(|s| prep_recvmsg(s, 0, msg, 0)).len, 1);
-        assert_eq!(built(|s| prep_sendmsg(s, 0, msg, 0)).len, 1);
-        assert_eq!(built(|s| prep_sendmsg_zc(s, 0, msg, 0)).len, 1);
+        assert_eq!(built(|s| prep_recvmsg(s, None, 0, msg, 0)).len, 1);
+        assert_eq!(built(|s| prep_sendmsg(s, None, 0, msg, 0)).len, 1);
+        assert_eq!(built(|s| prep_sendmsg_zc(s, None, 0, msg, 0)).len, 1);
 
         let how = NonNull::dangling();
         let path = NonNull::dangling();
-        assert_eq!(built(|s| prep_openat2(s, 0, path, how)).len, 24);
+        assert_eq!(built(|s| prep_openat2(s, None, 0, path, how)).len, 24);
 
         assert_eq!(
-            built(|s| prep_read_multishot(s, 0, 0, 0, 0)).flags,
+            built(|s| prep_read_multishot(s, None, 0, 0, 0, 0)).flags,
             sys::SqeFlags::BUFFER_SELECT
         );
         assert_eq!(
-            built(|s| prep_fixed_fd_install(s, 0, sys::InstallFdFlags::empty())).flags,
+            built(|s| prep_fixed_fd_install(s, None, 0, sys::InstallFdFlags::empty())).flags,
             sys::SqeFlags::FIXED_FILE
         );
     }
@@ -1000,15 +1001,15 @@ mod tests {
     fn slots_are_encoded_one_based() {
         let path = NonNull::dangling();
         assert_eq!(
-            built(|s| prep_openat_direct(s, 0, path, 0, 0, 0)).file_index,
+            built(|s| prep_openat_direct(s, None, 0, path, 0, 0, 0)).file_index,
             1
         );
         assert_eq!(
-            built(|s| prep_openat_direct(s, 0, path, 0, 0, 41)).file_index,
+            built(|s| prep_openat_direct(s, None, 0, path, 0, 0, 41)).file_index,
             42
         );
         assert_eq!(
-            built(|s| prep_openat_direct(s, 0, path, 0, 0, sys::FILE_INDEX_ALLOC)).file_index,
+            built(|s| prep_openat_direct(s, None, 0, path, 0, 0, sys::FILE_INDEX_ALLOC)).file_index,
             sys::FILE_INDEX_ALLOC
         );
     }
@@ -1017,7 +1018,7 @@ mod tests {
     /// length pointer without an address.
     #[test]
     fn accept_peer_is_all_or_nothing() {
-        let none = built(|s| prep_accept(s, 3, None, 0));
+        let none = built(|s| prep_accept(s, None, 3, None, 0));
         assert_eq!((none.addr, none.addr2), (0, 0));
 
         let mut sa = [0u8; 128];
@@ -1026,7 +1027,7 @@ mod tests {
             NonNull::from(&mut sa).cast::<c_void>(),
             NonNull::from(&mut salen),
         );
-        let set = built(|s| prep_accept(s, 3, Some(peer), 0));
+        let set = built(|s| prep_accept(s, None, 3, Some(peer), 0));
         assert_eq!(set.addr, peer.0.as_ptr() as u64);
         assert_eq!(set.addr2, peer.1.as_ptr() as u64);
     }
@@ -1035,7 +1036,7 @@ mod tests {
     /// union slots — the easiest encoding to get wrong.
     #[test]
     fn splice_encodes_both_ends() {
-        let sqe = built(|s| prep_splice(s, 4, 100, 5, 200, 4096, sys::SPLICE_F_FD_IN_FIXED));
+        let sqe = built(|s| prep_splice(s, None, 4, 100, 5, 200, 4096, sys::SPLICE_F_FD_IN_FIXED));
         assert_eq!(sqe.fd, 4, "fd_out lands in fd");
         assert_eq!(sqe.addr2, 100, "off_out lands in addr2");
         assert_eq!(sqe.file_index, 5, "fd_in lands in the splice_fd_in slot");
@@ -1054,7 +1055,7 @@ mod tests {
         let name = NonNull::new(storage.as_mut_ptr()).unwrap().cast::<c_void>();
         let namelen = NonNull::new(&raw mut len).unwrap();
 
-        let sqe = built(|s| prep_cmd_getsockname(s, 3, name, namelen, 1));
+        let sqe = built(|s| prep_cmd_getsockname(s, None, 3, name, namelen, 1));
 
         assert_eq!(sqe.addr, name.as_ptr() as u64, "the address buffer");
         assert_eq!(sqe.addr3, namelen.as_ptr() as u64, "the in/out length");
@@ -1071,7 +1072,7 @@ mod tests {
     /// `prep_cmd_sock` packs level and optname into the two halves of one word.
     #[test]
     fn cmd_sock_packs_the_sockopt_pair() {
-        let sqe = built(|s| prep_cmd_sock(s, 3, 0, (1, 2), 0, 0));
+        let sqe = built(|s| prep_cmd_sock(s, None, 3, 0, (1, 2), 0, 0));
         assert_eq!(sqe.addr, 1 | (2u64 << 32));
         assert_eq!(sqe.addr2, 3);
     }
@@ -1082,46 +1083,58 @@ mod tests {
         let p = NonNull::dangling();
         let mut b = [0u8; 4];
         let buf = buf_of(&mut b);
-        assert_eq!(built(prep_nop).opcode, sys::Opcode::Nop);
+        assert_eq!(built(|s| prep_nop(s, None)).opcode, sys::Opcode::Nop);
         assert_eq!(
-            built(|s| prep_read(s, 0, buf, 0, 0)).opcode,
+            built(|s| prep_read(s, None, 0, buf, 0, 0)).opcode,
             sys::Opcode::Read
         );
         assert_eq!(
-            built(|s| prep_write(s, 0, buf, 0, 0)).opcode,
+            built(|s| prep_write(s, None, 0, buf, 0, 0)).opcode,
             sys::Opcode::Write
         );
-        assert_eq!(built(|s| prep_recv(s, 0, buf, 0)).opcode, sys::Opcode::Recv);
-        assert_eq!(built(|s| prep_send(s, 0, buf, 0)).opcode, sys::Opcode::Send);
-        assert_eq!(built(|s| prep_close(s, 0)).opcode, sys::Opcode::Close);
         assert_eq!(
-            built(|s| prep_close_direct(s, 0)).opcode,
+            built(|s| prep_recv(s, None, 0, buf, 0)).opcode,
+            sys::Opcode::Recv
+        );
+        assert_eq!(
+            built(|s| prep_send(s, None, 0, buf, 0)).opcode,
+            sys::Opcode::Send
+        );
+        assert_eq!(built(|s| prep_close(s, None, 0)).opcode, sys::Opcode::Close);
+        assert_eq!(
+            built(|s| prep_close_direct(s, None, 0)).opcode,
             sys::Opcode::Close
         );
         assert_eq!(
-            built(|s| prep_socket_direct(s, 0, 0, 0, 0, 0)).opcode,
+            built(|s| prep_socket_direct(s, None, 0, 0, 0, 0, 0)).opcode,
             sys::Opcode::Socket
         );
         assert_eq!(
-            built(|s| prep_connect(s, 0, p, 0)).opcode,
+            built(|s| prep_connect(s, None, 0, p, 0)).opcode,
             sys::Opcode::Connect
         );
-        assert_eq!(built(|s| prep_bind(s, 0, p, 0)).opcode, sys::Opcode::Bind);
-        assert_eq!(built(|s| prep_listen(s, 0, 0)).opcode, sys::Opcode::Listen);
         assert_eq!(
-            built(|s| prep_shutdown(s, 0, 0)).opcode,
+            built(|s| prep_bind(s, None, 0, p, 0)).opcode,
+            sys::Opcode::Bind
+        );
+        assert_eq!(
+            built(|s| prep_listen(s, None, 0, 0)).opcode,
+            sys::Opcode::Listen
+        );
+        assert_eq!(
+            built(|s| prep_shutdown(s, None, 0, 0)).opcode,
             sys::Opcode::Shutdown
         );
         assert_eq!(
-            built(|s| prep_accept_direct(s, 0, None, 0, 0)).opcode,
+            built(|s| prep_accept_direct(s, None, 0, None, 0, 0)).opcode,
             sys::Opcode::Accept
         );
         assert_eq!(
-            built(|s| prep_cancel(s, 0, sys::AsyncCancelFlags::empty())).opcode,
+            built(|s| prep_cancel(s, None, 0, sys::AsyncCancelFlags::empty())).opcode,
             sys::Opcode::AsyncCancel
         );
         assert_eq!(
-            built(|s| prep_cmd_getsockname(s, 0, p.cast(), p.cast(), 0)).opcode,
+            built(|s| prep_cmd_getsockname(s, None, 0, p.cast(), p.cast(), 0)).opcode,
             sys::Opcode::UringCmd
         );
     }
@@ -1179,17 +1192,17 @@ mod tests {
 
         let mut out = MSG;
         let obuf = buf_of(&mut out);
-        let n = run(&ring, |s| prep_write(s, wr, obuf, u64::MAX, 0));
+        let n = run(&ring, |s| prep_write(s, None, wr, obuf, u64::MAX, 0));
         assert_eq!(n, MSG.len() as i32, "short write: {n}");
 
         let mut back = [0u8; 32];
         let bbuf = buf_of(&mut back);
-        let n = run(&ring, |s| prep_read(s, rd, bbuf, u64::MAX, 0));
+        let n = run(&ring, |s| prep_read(s, None, rd, bbuf, u64::MAX, 0));
         assert_eq!(n, MSG.len() as i32, "short read: {n}");
         assert_eq!(back[..MSG.len()], MSG);
 
-        assert_eq!(run(&ring, |s| prep_close(s, wr)), 0);
-        assert_eq!(run(&ring, |s| prep_close(s, rd)), 0);
+        assert_eq!(run(&ring, |s| prep_close(s, None, wr)), 0);
+        assert_eq!(run(&ring, |s| prep_close(s, None, rd)), 0);
     }
 
     /// A `Nop` with an injected result comes back carrying it.
@@ -1198,7 +1211,7 @@ mod tests {
     fn nop_injects_its_result() {
         let mut params = sys::Params::default();
         let ring = Ring::with_params(8, &mut params).expect("Ring::with_params");
-        assert_eq!(run(&ring, prep_nop), 0);
-        assert_eq!(run(&ring, |s| prep_nop_inject(s, 42)), 42);
+        assert_eq!(run(&ring, |s| prep_nop(s, None)), 0);
+        assert_eq!(run(&ring, |s| prep_nop_inject(s, None, 42)), 42);
     }
 }

@@ -54,11 +54,10 @@ pub(crate) struct Op<'a, D: Completable> {
 impl<'a, D: Completable> Op<'a, D> {
     pub(crate) fn submit(
         driver: &'a Driver,
-        sqe_flags: sys::SqeFlags,
         prep: impl FnOnce(uring_op::Slot<'_>),
         data: D,
     ) -> Op<'a, D> {
-        let key = driver.submit(sqe_flags, prep);
+        let key = driver.submit(prep);
 
         Op {
             driver,
@@ -159,13 +158,12 @@ impl<'a, const N: usize, D: ChainCompletable<N>> Chain<'a, N, D> {
     /// Submit `N` linked operations as one chain.
     pub(crate) fn submit(
         driver: &'a Driver,
-        per_entry_flags: [sys::SqeFlags; N],
         prep: impl FnOnce([uring_op::Slot<'_>; N]),
         data: D,
     ) -> Chain<'a, N, D> {
         Chain {
             driver,
-            keys: driver.submit_chain(per_entry_flags, prep),
+            keys: driver.submit_chain(prep),
             results: [0; N],
             collected: 0,
             data: Some(data),

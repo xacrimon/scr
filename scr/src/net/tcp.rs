@@ -47,8 +47,7 @@ const BACKLOG: u32 = 1024;
 /// unconditional instead of having to work out how far a chain got.
 fn close_slot(driver: &Driver, slot: u32) {
     driver.submit_detached(
-        sys::SqeFlags::empty(),
-        |s| op::prep_close_direct(s, slot),
+        |s| op::prep_close_direct(s, None, slot),
         Box::new(FreeSlot(slot)),
     );
 }
@@ -75,8 +74,16 @@ async fn sock_name(driver: &Driver, slot: u32, peer: bool) -> io::Result<SocketA
 
     Op::submit(
         driver,
-        sys::SqeFlags::FIXED_FILE,
-        |s| op::prep_cmd_getsockname(s, slot as i32, name, namelen, peer as u32),
+        |s| {
+            op::prep_cmd_getsockname(
+                s,
+                sys::SqeFlags::FIXED_FILE,
+                slot as i32,
+                name,
+                namelen,
+                peer as u32,
+            )
+        },
         GetName { addr },
     )
     .await
@@ -150,22 +157,24 @@ impl TcpListener {
         // unlike the two that follow. `submit_chain` adds the links.
         Chain::submit(
             &driver,
-            [
-                sys::SqeFlags::empty(),
-                sys::SqeFlags::FIXED_FILE,
-                sys::SqeFlags::FIXED_FILE,
-            ],
             |[a, b, c]| {
                 op::prep_socket_direct(
                     a,
+                    None,
                     SockAddr::domain(addr),
                     libc::SOCK_STREAM as u64,
                     0,
                     0,
                     slot,
                 );
-                op::prep_bind(b, slot as i32, addr_ptr, addr_len);
-                op::prep_listen(c, slot as i32, BACKLOG);
+                op::prep_bind(
+                    b,
+                    sys::SqeFlags::FIXED_FILE,
+                    slot as i32,
+                    addr_ptr,
+                    addr_len,
+                );
+                op::prep_listen(c, sys::SqeFlags::FIXED_FILE, slot as i32, BACKLOG);
             },
             data,
         )
@@ -190,8 +199,16 @@ impl TcpListener {
 
         Op::submit(
             &self.driver,
-            sys::SqeFlags::FIXED_FILE,
-            |s| op::prep_accept_direct(s, self.slot as i32, Some(peer_ptrs), 0, slot),
+            |s| {
+                op::prep_accept_direct(
+                    s,
+                    sys::SqeFlags::FIXED_FILE,
+                    self.slot as i32,
+                    Some(peer_ptrs),
+                    0,
+                    slot,
+                )
+            },
             data,
         )
         .await
@@ -345,17 +362,23 @@ impl TcpStream {
         // neither `FIXED_FILE` nor the slot in `fd`. `submit_chain` adds the link.
         Chain::submit(
             &driver,
-            [sys::SqeFlags::empty(), sys::SqeFlags::FIXED_FILE],
             |[a, b]| {
                 op::prep_socket_direct(
                     a,
+                    None,
                     SockAddr::domain(addr),
                     libc::SOCK_STREAM as u64,
                     0,
                     0,
                     slot,
                 );
-                op::prep_connect(b, slot as i32, addr_ptr, addr_len);
+                op::prep_connect(
+                    b,
+                    sys::SqeFlags::FIXED_FILE,
+                    slot as i32,
+                    addr_ptr,
+                    addr_len,
+                );
             },
             data,
         )
@@ -414,8 +437,7 @@ impl AsyncRead for TcpStream {
 
         Op::submit(
             &self.driver,
-            sys::SqeFlags::FIXED_FILE,
-            |s| op::prep_recv(s, self.slot as i32, window, 0),
+            |s| op::prep_recv(s, sys::SqeFlags::FIXED_FILE, self.slot as i32, window, 0),
             Recv { buf },
         )
         .await
@@ -431,8 +453,7 @@ impl AsyncWrite for TcpStream {
 
         Op::submit(
             &self.driver,
-            sys::SqeFlags::FIXED_FILE,
-            |s| op::prep_send(s, self.slot as i32, window, 0),
+            |s| op::prep_send(s, sys::SqeFlags::FIXED_FILE, self.slot as i32, window, 0),
             Send { buf },
         )
         .await
@@ -445,8 +466,14 @@ impl AsyncWrite for TcpStream {
     async fn shutdown(&self) -> io::Result<()> {
         Op::submit(
             &self.driver,
-            sys::SqeFlags::FIXED_FILE,
-            |s| op::prep_shutdown(s, self.slot as i32, libc::SHUT_WR as u32),
+            |s| {
+                op::prep_shutdown(
+                    s,
+                    sys::SqeFlags::FIXED_FILE,
+                    self.slot as i32,
+                    libc::SHUT_WR as u32,
+                )
+            },
             Shutdown,
         )
         .await

@@ -285,15 +285,12 @@ mod tests {
     use crate::io_uring::sys;
     use crate::io_uring::syscall;
 
-    /// Submit one entry with `flags`, wait for its completion, report the result.
-    fn run(ring: &Ring, flags: sys::SqeFlags, prep: impl FnOnce(op::Slot<'_>)) -> CqeResult {
+    fn run(ring: &Ring, prep: impl FnOnce(op::Slot<'_>)) -> CqeResult {
         let sq = ring.sq();
         let tail = sq.tail();
         // SAFETY: the ring is idle in these tests, so this slot is ours.
         let ptr = unsafe { sq.sqe(tail) };
         prep(unsafe { op::Slot::from_raw(ptr) });
-        // SAFETY: `prep` initialised the entry.
-        unsafe { (*ptr).flags |= flags };
         sq.set_tail(tail + 1);
 
         // SAFETY: no argument is passed, and every SQE these tests build names
@@ -467,8 +464,9 @@ mod tests {
         let mut got = [0u8; 5];
         let gbuf = NonNull::from(&mut got);
         assert_eq!(
-            run(&ring, sys::SqeFlags::FIXED_FILE, |s| op::prep_read(
+            run(&ring, |s| op::prep_read(
                 s,
+                sys::SqeFlags::FIXED_FILE,
                 slot as i32,
                 gbuf,
                 !0,
@@ -500,8 +498,13 @@ mod tests {
         let mut got = [0u8; 4];
         let gbuf = NonNull::from(&mut got);
         assert_eq!(
-            run(&ring, sys::SqeFlags::FIXED_FILE, |s| op::prep_read(
-                s, 3, gbuf, 0, 0
+            run(&ring, |s| op::prep_read(
+                s,
+                sys::SqeFlags::FIXED_FILE,
+                3,
+                gbuf,
+                0,
+                0
             )),
             CqeResult::Error(Errno(libc::EBADF))
         );
@@ -517,9 +520,10 @@ mod tests {
         let range = files.kernel_range().expect("a kernel region");
 
         for _ in 0..range.len() {
-            match run(&ring, sys::SqeFlags::empty(), |s| {
+            match run(&ring, |s| {
                 op::prep_socket_direct(
                     s,
+                    None,
                     libc::AF_INET,
                     libc::SOCK_STREAM as u64,
                     0,
@@ -537,8 +541,9 @@ mod tests {
 
         // Exhausted: the kernel will not spill into the managed region.
         assert_eq!(
-            run(&ring, sys::SqeFlags::empty(), |s| op::prep_socket_direct(
+            run(&ring, |s| op::prep_socket_direct(
                 s,
+                None,
                 libc::AF_INET,
                 libc::SOCK_STREAM as u64,
                 0,
@@ -578,9 +583,7 @@ mod tests {
         let slot = files.install(&ring, r).expect("install");
 
         assert_eq!(
-            run(&ring, sys::SqeFlags::empty(), |s| op::prep_close_direct(
-                s, slot
-            )),
+            run(&ring, |s| op::prep_close_direct(s, None, slot)),
             CqeResult::Value(0)
         );
         files.free(slot);
@@ -589,8 +592,9 @@ mod tests {
         let mut got = [0u8; 4];
         let gbuf = NonNull::from(&mut got);
         assert_eq!(
-            run(&ring, sys::SqeFlags::FIXED_FILE, |s| op::prep_read(
+            run(&ring, |s| op::prep_read(
                 s,
+                sys::SqeFlags::FIXED_FILE,
                 slot as i32,
                 gbuf,
                 0,

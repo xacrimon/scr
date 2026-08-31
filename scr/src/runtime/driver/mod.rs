@@ -195,7 +195,7 @@ impl Driver {
     ///
     /// `prep` fills the reserved slot in place — see [`Driver::fill`].
     /// `sqe_flags` is ORed onto whatever the prep function set.
-    pub(crate) fn submit<F>(&self, sqe_flags: sys::SqeFlags, prep: F) -> OpKey
+    pub(crate) fn submit<F>(&self, prep: F) -> OpKey
     where
         F: FnOnce(uring_op::Slot<'_>),
     {
@@ -204,7 +204,6 @@ impl Driver {
         let sqe = slot.as_raw();
         prep(slot);
         unsafe {
-            (*sqe).flags = sqe_flags;
             (*sqe).user_data = key.user_data();
         }
         key
@@ -219,11 +218,7 @@ impl Driver {
     /// submission is what stops a dangling link head from splitting it. Each
     /// member gets its own ledger entry and posts exactly one completion: its
     /// own result, or `ECANCELED` once an earlier one failed.
-    pub(crate) fn submit_chain<const N: usize, F>(
-        &self,
-        per_entry_flags: [sys::SqeFlags; N],
-        prep: F,
-    ) -> [OpKey; N]
+    pub(crate) fn submit_chain<const N: usize, F>(&self, prep: F) -> [OpKey; N]
     where
         F: FnOnce([uring_op::Slot<'_>; N]),
     {
@@ -246,7 +241,7 @@ impl Driver {
             sub.backlog.is_empty() && self.space_left(&sub) as usize >= N
         };
         if !contiguous {
-            self.backlog_chain(per_entry_flags, &keys, prep);
+            self.backlog_chain(&keys, prep);
             return keys;
         }
 
@@ -264,7 +259,7 @@ impl Driver {
         prep(ptrs.map(|p| unsafe { uring_op::Slot::from_raw(p) }));
         for (i, &ptr) in ptrs.iter().enumerate() {
             // SAFETY: `prep` initialised each slot bar `user_data`.
-            chain_stamp(unsafe { &mut *ptr }, i, N, per_entry_flags[i], keys[i]);
+            chain_stamp(unsafe { &mut *ptr }, i, N, keys[i]);
         }
 
         keys
@@ -278,12 +273,8 @@ impl Driver {
     /// never rotated.
     #[cold]
     #[inline(never)]
-    fn backlog_chain<const N: usize, F>(
-        &self,
-        per_entry_flags: [sys::SqeFlags; N],
-        keys: &[OpKey; N],
-        prep: F,
-    ) where
+    fn backlog_chain<const N: usize, F>(&self, keys: &[OpKey; N], prep: F)
+    where
         F: FnOnce([uring_op::Slot<'_>; N]),
     {
         let mut block = [const { sys::Sqe::ZEROED }; N];
@@ -293,7 +284,7 @@ impl Driver {
                 .map(|sqe| unsafe { uring_op::Slot::from_raw(sqe) }),
         );
         for (i, sqe) in block.iter_mut().enumerate() {
-            chain_stamp(sqe, i, N, per_entry_flags[i], keys[i]);
+            chain_stamp(sqe, i, N, keys[i]);
         }
         self.sub.borrow_mut().backlog.extend(block);
     }
@@ -302,7 +293,6 @@ impl Driver {
     /// lands.
     pub(crate) fn submit_detached(
         &self,
-        sqe_flags: sys::SqeFlags,
         prep: impl FnOnce(uring_op::Slot<'_>),
         action: Box<dyn OnComplete>,
     ) {
@@ -311,7 +301,6 @@ impl Driver {
         let sqe = slot.as_raw();
         prep(slot);
         unsafe {
-            (*sqe).flags = sqe_flags;
             (*sqe).user_data = key.user_data();
         }
     }
@@ -322,8 +311,9 @@ impl Driver {
     /// cancel completes with `ENOENT` and the original result stands.
     pub(crate) fn cancel(&self, key: OpKey) {
         self.submit_detached(
-            sys::SqeFlags::empty(),
-            |slot| uring_op::prep_cancel(slot, key.user_data(), sys::AsyncCancelFlags::empty()),
+            |slot| {
+                uring_op::prep_cancel(slot, None, key.user_data(), sys::AsyncCancelFlags::empty())
+            },
             Box::new(Discard),
         );
     }
@@ -331,10 +321,10 @@ impl Driver {
     /// Stop every operation still in flight on `slot`, in one entry.
     pub(crate) fn cancel_slot(&self, slot: u32) {
         self.submit_detached(
-            sys::SqeFlags::empty(),
             |s| {
                 uring_op::prep_cancel_fd(
                     s,
+                    None,
                     slot as i32,
                     sys::AsyncCancelFlags::FD
                         | sys::AsyncCancelFlags::FD_FIXED
@@ -591,13 +581,11 @@ fn is_linked(sqe: &sys::Sqe) -> bool {
 /// Stamp a chain member: its own `per_entry` flags, plus the
 /// [`sys::SqeFlags::IO_LINK`] that ties it to the next entry unless it is the
 /// last, plus its ledger token.
-fn chain_stamp(sqe: &mut sys::Sqe, i: usize, n: usize, per_entry: sys::SqeFlags, key: OpKey) {
-    let link = if i + 1 < n {
-        sys::SqeFlags::IO_LINK
-    } else {
-        sys::SqeFlags::empty()
-    };
-    sqe.flags |= per_entry | link;
+fn chain_stamp(sqe: &mut sys::Sqe, i: usize, n: usize, key: OpKey) {
+    if i + 1 < n {
+        sqe.flags |= sys::SqeFlags::IO_LINK;
+    }
+
     sqe.user_data = key.user_data();
 }
 
@@ -646,7 +634,7 @@ mod tests {
     fn nop() -> sys::Sqe {
         let mut sqe = sys::Sqe::ZEROED;
         // SAFETY: `sqe` outlives the slot.
-        uring_op::prep_nop(unsafe { uring_op::Slot::from_raw(&mut sqe) });
+        uring_op::prep_nop(unsafe { uring_op::Slot::from_raw(&mut sqe) }, None);
         sqe
     }
 
@@ -658,7 +646,7 @@ mod tests {
 
     /// Fill a slot with a `Nop`, for the submit paths that take a prep closure.
     fn prep_nop(slot: uring_op::Slot<'_>) {
-        uring_op::prep_nop(slot);
+        uring_op::prep_nop(slot, None);
     }
 
     /// A small ring, so the paths that only open up under pressure are the
@@ -680,7 +668,7 @@ mod tests {
         const N: u32 = 100;
 
         for _ in 0..N {
-            driver.submit_detached(sys::SqeFlags::empty(), prep_nop, Box::new(Discard));
+            driver.submit_detached(prep_nop, Box::new(Discard));
         }
 
         assert_eq!(driver.in_flight(), N);
@@ -703,7 +691,7 @@ mod tests {
         let driver = driver();
 
         for _ in 0..10 {
-            driver.submit_detached(sys::SqeFlags::empty(), prep_nop, Box::new(Discard));
+            driver.submit_detached(prep_nop, Box::new(Discard));
         }
         assert!(
             driver.backlog_pending(),
@@ -729,7 +717,7 @@ mod tests {
         const N: u32 = 200;
 
         for _ in 0..N {
-            driver.submit_detached(sys::SqeFlags::empty(), prep_nop, Box::new(Discard));
+            driver.submit_detached(prep_nop, Box::new(Discard));
         }
         drain(&driver);
 
@@ -745,11 +733,11 @@ mod tests {
 
         // Six of eight slots taken, so three will not fit.
         for _ in 0..6 {
-            driver.submit_detached(sys::SqeFlags::empty(), prep_nop, Box::new(Discard));
+            driver.submit_detached(prep_nop, Box::new(Discard));
         }
         assert!(!driver.backlog_pending(), "six of eight fit");
 
-        let keys = driver.submit_chain([sys::SqeFlags::empty(); 3], |[a, b, c]| {
+        let keys = driver.submit_chain(|[a, b, c]| {
             prep_nop(a);
             prep_nop(b);
             prep_nop(c);
