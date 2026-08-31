@@ -17,8 +17,7 @@
 
 use std::time::{Duration, Instant};
 
-use scr::Runtime;
-use scr::time;
+use scr::{Runtime, time};
 
 /// Enough samples for a p99 to mean something, few enough to finish quickly at
 /// the largest target below.

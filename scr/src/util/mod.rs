@@ -1,4 +1,4 @@
-mod linked_list;
+pub(crate) mod linked_list;
 mod rand32;
 mod sync_wrapper;
 

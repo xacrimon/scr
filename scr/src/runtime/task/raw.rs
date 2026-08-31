@@ -1,11 +1,10 @@
 use std::any::Any;
-use std::fmt;
 use std::mem::ManuallyDrop;
 use std::panic::{self, AssertUnwindSafe, Location};
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::task::{Context, ContextBuilder, LocalWaker, Poll};
-use std::{cell, mem};
+use std::{cell, fmt, mem};
 
 use crate::runtime::context;
 use crate::runtime::stub_waker::stub_waker;

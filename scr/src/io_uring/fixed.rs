@@ -280,10 +280,8 @@ mod tests {
     use std::ptr::NonNull;
 
     use super::*;
-    use crate::io_uring::op;
     use crate::io_uring::ring::CqeResult;
-    use crate::io_uring::sys;
-    use crate::io_uring::syscall;
+    use crate::io_uring::{op, sys, syscall};
 
     fn run(ring: &Ring, prep: impl FnOnce(op::Slot<'_>)) -> CqeResult {
         let sq = ring.sq();

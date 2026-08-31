@@ -4,9 +4,8 @@ use std::panic::Location;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-pub use crate::runtime::task::{AbortHandle, Id, JoinError, JoinHandle, id, try_id};
-
 use crate::runtime::context;
+pub use crate::runtime::task::{AbortHandle, Id, JoinError, JoinHandle, id, try_id};
 
 /// Spawns a new asynchronous task on the current runtime, returning a
 /// [`JoinHandle`] for it.

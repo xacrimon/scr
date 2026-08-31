@@ -67,7 +67,6 @@ use hyper::rt::{Executor, ReadBufCursor};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-
 use scr::io::{AsyncRead, AsyncWrite};
 use scr::net::TcpListener;
 use scr::{Runtime, spawn};

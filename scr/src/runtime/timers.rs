@@ -415,7 +415,6 @@ impl Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::runtime::driver::noop_local_waker;
 
     /// The heap's invariant, checked from the outside: every parent is due no

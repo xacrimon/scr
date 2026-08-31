@@ -3,13 +3,13 @@ mod notify; // TODO
 mod ll_semaphore; // TODO
 mod semaphore; // TODO
 
-mod oneshot; // TODO
-mod mpmc; // TODO
 mod broadcast; // TODO
+mod mpmc; // TODO
+mod oneshot; // TODO
 mod watch; // TODO
 
-mod once_cell; // TODO
-mod lazy_cell; // TODO
+mod lazy_cell;
+mod once_cell; // TODO // TODO
 
 //mod barrier;
 

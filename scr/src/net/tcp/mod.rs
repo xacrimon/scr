@@ -22,12 +22,12 @@ mod stream;
 
 #[cfg(debug_assertions)]
 use std::cell::Cell;
-use std::fmt;
-use std::io;
 use std::net::SocketAddr;
 use std::ptr::NonNull;
 use std::rc::Rc;
+use std::{fmt, io};
 
+use super::addr::SockAddr;
 use crate::buf::{BufResult, IoBuf, IoBufMut};
 use crate::io::{AsyncRead, AsyncWrite};
 use crate::io_uring::{op, sys};
@@ -35,8 +35,6 @@ use crate::runtime::context;
 use crate::runtime::driver::Driver;
 use crate::runtime::driver::ledger::OnComplete;
 use crate::runtime::driver::op::{Chain, ChainCompletable, Completable, Op};
-
-use super::addr::SockAddr;
 
 /// Connections the kernel may queue before we accept them.
 const BACKLOG: u32 = 1024;
@@ -623,13 +621,12 @@ impl Completable for Shutdown {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::io::{Read as _, Write as _};
     use std::net::TcpStream as StdStream;
     use std::task::{ContextBuilder, Poll, Waker};
     use std::thread;
 
+    use super::*;
     use crate::Runtime;
     use crate::runtime::driver::noop_local_waker;
 

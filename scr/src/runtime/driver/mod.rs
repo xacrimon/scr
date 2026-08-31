@@ -26,19 +26,16 @@ pub(crate) mod ledger;
 pub(crate) mod op;
 
 use std::cell::RefCell;
-use std::cmp;
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::ptr;
 use std::time::Duration;
-
-use crate::io_uring::fixed::FixedFiles;
-use crate::io_uring::op as uring_op;
-use crate::io_uring::ring::Ring;
-use crate::io_uring::sys;
-use crate::io_uring::syscall::{self, Errno};
+use std::{cmp, ptr};
 
 use self::ledger::{Discard, Ledger, OnComplete, OpKey, Outcome};
+use crate::io_uring::fixed::FixedFiles;
+use crate::io_uring::ring::Ring;
+use crate::io_uring::syscall::{self, Errno};
+use crate::io_uring::{op as uring_op, sys};
 
 /// Submission ring entries. Small on purpose: the backlog path is a correctness
 /// requirement rather than an edge case, so it should be exercised constantly

@@ -4,9 +4,8 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use scr::Runtime;
-use scr::task;
 use scr::time::{self, Elapsed, MissedTickBehavior};
+use scr::{Runtime, task};
 
 /// How far past a deadline a firing is still considered prompt.
 const SLACK: Duration = Duration::from_millis(50);
@@ -362,10 +361,10 @@ fn a_runtime_with_nothing_but_a_timer_still_makes_progress() {
 /// timeout on the `io_uring_enter` that was waiting for one. Whichever comes
 /// first has to end that wait.
 mod with_io {
-    use super::*;
-
     use scr::io::{AsyncRead, AsyncWrite};
     use scr::net::{TcpListener, TcpStream};
+
+    use super::*;
 
     /// A connected pair, and the listener kept alive alongside them.
     ///

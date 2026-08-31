@@ -25,9 +25,8 @@ use std::task::{LocalWaker, Poll};
 
 use slab::Slab;
 
-use crate::io_uring::sys;
-
 use super::Driver;
+use crate::io_uring::sys;
 
 /// What to do with a completion, decided while the ledger is borrowed and
 /// carried out after that borrow has been released.

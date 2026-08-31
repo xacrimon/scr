@@ -7,18 +7,16 @@ mod raw;
 mod state;
 mod waker;
 
+use std::panic::Location;
+use std::ptr::NonNull;
+use std::{fmt, mem};
+
 pub use self::abort::AbortHandle;
 pub use self::error::JoinError;
 pub use self::id::{Id, id, try_id};
 pub use self::join::JoinHandle;
-
 pub(crate) use self::owned::OwnedTasks;
 pub(crate) use self::raw::{Header, RawTask};
-
-use std::fmt;
-use std::mem;
-use std::panic::Location;
-use std::ptr::NonNull;
 
 pub(crate) type Result = std::result::Result<(), JoinError>;
 

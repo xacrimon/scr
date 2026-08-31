@@ -5,10 +5,9 @@
 //! live on the heap and be owned by the operation — the same rule buffers
 //! follow, for the same reason.
 
-use std::io;
-use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::ptr::NonNull;
+use std::{io, mem};
 
 /// A `sockaddr_storage` and the length that goes with it, boxed together.
 #[repr(C)]

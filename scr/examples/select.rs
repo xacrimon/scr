@@ -1,9 +1,6 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use scr::Runtime;
-use scr::select;
-use scr::time;
-use std::time::Instant;
+use scr::{Runtime, select, time};
 
 fn main() {
     Runtime::new().unwrap().block_on(alternate());

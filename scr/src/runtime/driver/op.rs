@@ -10,11 +10,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crate::io_uring::op as uring_op;
-use crate::io_uring::sys;
-
 use super::Driver;
 use super::ledger::{Discard, OnComplete, OpKey};
+use crate::io_uring::{op as uring_op, sys};
 
 // ---------------------------------------------------------------------------
 // A single operation

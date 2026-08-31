@@ -437,9 +437,9 @@ impl<T> fmt::Debug for Pointers<T> {
 }
 
 pub(crate) mod tests {
-    use super::*;
-
     use std::pin::Pin;
+
+    use super::*;
 
     #[derive(Debug)]
     #[repr(C)]

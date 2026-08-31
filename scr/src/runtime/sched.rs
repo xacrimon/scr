@@ -125,10 +125,10 @@ impl Queue {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::cell::Cell;
     use std::rc::Rc;
+
+    use super::*;
 
     #[test]
     fn bind_on_closed_registry_shuts_the_task_down() {
