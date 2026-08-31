@@ -13,7 +13,7 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::{hint, io, ptr};
+use std::{io, ptr};
 
 use super::sys;
 
