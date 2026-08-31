@@ -8,6 +8,8 @@ pub mod buf;
 pub mod io;
 pub mod macros;
 pub mod net;
+pub mod signal;
+pub mod sync;
 pub mod task;
 pub mod time;
 
