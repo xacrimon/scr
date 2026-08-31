@@ -86,8 +86,9 @@ impl std::fmt::Display for Errno {
 
 impl std::error::Error for Errno {}
 
-fn libc_check_err(val: i32) -> Result<(), Errno> {
-    if val >= 0 { Ok(()) } else { Err(Errno::last()) }
+macro_rules! libc_try {
+    ($i:ident) => { libc_try!($i, < 0) };
+    ($i:ident, $($cmp_rhs:tt)*) => { if $i $($cmp_rhs)* { return Err(Errno::last()) } };
 }
 
 /// `io_uring_setup(2)`.
@@ -105,10 +106,10 @@ pub fn io_uring_setup(entries: u32, params: &mut sys::Params) -> Result<u32, Err
             libc::SYS_io_uring_setup,
             entries as libc::c_long,
             params as *mut sys::Params as libc::c_long,
-        ) as i32
+        )
     };
 
-    libc_check_err(v)?;
+    libc_try!(v);
     Ok(v as u32)
 }
 
@@ -144,10 +145,10 @@ pub unsafe fn io_uring_enter(
             flags.bits() as libc::c_long,
             arg as libc::c_long,
             argsz as libc::c_long,
-        ) as i32
+        )
     };
 
-    libc_check_err(v)?;
+    libc_try!(v);
     Ok(v as u32)
 }
 
@@ -175,10 +176,10 @@ pub unsafe fn io_uring_register(
             op as libc::c_long,
             arg as libc::c_long,
             nr_args as libc::c_long,
-        ) as i32
+        )
     };
 
-    libc_check_err(v)?;
+    libc_try!(v);
     Ok(v as u32)
 }
 
@@ -197,9 +198,7 @@ pub unsafe fn map_ring(len: usize, fd: i32, offset: u64) -> Result<NonNull<c_voi
 
     // SAFETY: forwarded to the caller's contract.
     let p = unsafe { libc::mmap(ptr::null_mut(), len, prot, flags, fd, offset as libc::off_t) };
-    if p == libc::MAP_FAILED {
-        return Err(Errno::last());
-    }
+    libc_try!(p, == libc::MAP_FAILED);
 
     // SAFETY: mmap returns either MAP_FAILED or a non-null mapping.
     Ok(unsafe { NonNull::new_unchecked(p) })
@@ -214,7 +213,8 @@ pub unsafe fn map_ring(len: usize, fd: i32, offset: u64) -> Result<NonNull<c_voi
 pub unsafe fn munmap(addr: NonNull<c_void>, len: usize) -> Result<(), Errno> {
     // SAFETY: forwarded to the caller's contract.
     let v = unsafe { libc::munmap(addr.as_ptr(), len) };
-    libc_check_err(v)
+    libc_try!(v);
+    Ok(())
 }
 
 /// `close(2)`.
@@ -227,7 +227,8 @@ pub unsafe fn munmap(addr: NonNull<c_void>, len: usize) -> Result<(), Errno> {
 pub unsafe fn close(fd: i32) -> Result<(), Errno> {
     // SAFETY: forwarded to the caller's contract.
     let v = unsafe { libc::close(fd) };
-    libc_check_err(v)
+    libc_try!(v);
+    Ok(())
 }
 
 #[cfg(test)]
