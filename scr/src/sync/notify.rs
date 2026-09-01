@@ -403,6 +403,7 @@ impl NotifiedProject<'_> {
 
         match *state {
             NotifiedState::Init => {
+                let waker = waker.cloned();
                 let curr = notify.state.get();
 
                 if curr.notify_waiters_calls != *notify_waiters_calls {
@@ -419,30 +420,11 @@ impl NotifiedProject<'_> {
                     return Poll::Ready(());
                 }
 
-                let waker = waker.cloned();
-                let curr = notify.state.get();
-                let mut waiters = notify.waiters.borrow_mut();
-
-                if curr.notify_waiters_calls != *notify_waiters_calls {
-                    *state = NotifiedState::Done;
-                    return Poll::Ready(());
-                }
-
-                match curr.phase {
-                    Phase::Waiting => (),
-                    Phase::Empty => notify.state.set(State {
+                if matches!(curr.phase, Phase::Empty) {
+                    notify.state.set(State {
                         phase: Phase::Waiting,
                         ..curr
-                    }),
-                    Phase::Notified => {
-                        notify.state.set(State {
-                            phase: Phase::Empty,
-                            ..curr
-                        });
-
-                        *state = NotifiedState::Done;
-                        return Poll::Ready(());
-                    }
+                    });
                 }
 
                 let mut old_waker = None;
@@ -452,6 +434,7 @@ impl NotifiedProject<'_> {
                     }
                 }
 
+                let mut waiters = notify.waiters.borrow_mut();
                 waiters.push_front(NonNull::from(waiter));
                 *state = NotifiedState::Waiting;
 
