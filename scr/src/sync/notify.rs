@@ -401,116 +401,114 @@ impl NotifiedProject<'_> {
             waiter,
         } = self;
 
-        'outer_loop: loop {
-            match *state {
-                NotifiedState::Init => {
-                    let curr = notify.state.get();
+        match *state {
+            NotifiedState::Init => {
+                let curr = notify.state.get();
 
-                    if curr.notify_waiters_calls != *notify_waiters_calls {
-                        *state = NotifiedState::Done;
-                        continue 'outer_loop;
-                    }
+                if curr.notify_waiters_calls != *notify_waiters_calls {
+                    *state = NotifiedState::Done;
+                    return Poll::Ready(());
+                }
 
-                    if matches!(curr.phase, Phase::Notified) {
+                if matches!(curr.phase, Phase::Notified) {
+                    notify.state.set(State {
+                        phase: Phase::Empty,
+                        ..curr
+                    });
+                    *state = NotifiedState::Done;
+                    return Poll::Ready(());
+                }
+
+                let waker = waker.cloned();
+                let curr = notify.state.get();
+                let mut waiters = notify.waiters.borrow_mut();
+
+                if curr.notify_waiters_calls != *notify_waiters_calls {
+                    *state = NotifiedState::Done;
+                    return Poll::Ready(());
+                }
+
+                match curr.phase {
+                    Phase::Waiting => (),
+                    Phase::Empty => notify.state.set(State {
+                        phase: Phase::Waiting,
+                        ..curr
+                    }),
+                    Phase::Notified => {
                         notify.state.set(State {
                             phase: Phase::Empty,
                             ..curr
                         });
-                        *state = NotifiedState::Done;
-                        continue 'outer_loop;
-                    }
-
-                    let waker = waker.cloned();
-                    let curr = notify.state.get();
-                    let mut waiters = notify.waiters.borrow_mut();
-
-                    if curr.notify_waiters_calls != *notify_waiters_calls {
-                        *state = NotifiedState::Done;
-                        continue 'outer_loop;
-                    }
-
-                    match curr.phase {
-                        Phase::Waiting => (),
-                        Phase::Empty => notify.state.set(State {
-                            phase: Phase::Waiting,
-                            ..curr
-                        }),
-                        Phase::Notified => {
-                            notify.state.set(State {
-                                phase: Phase::Empty,
-                                ..curr
-                            });
-
-                            *state = NotifiedState::Done;
-                            continue 'outer_loop;
-                        }
-                    }
-
-                    let mut old_waker = None;
-                    if waker.is_some() {
-                        unsafe {
-                            old_waker = mem::replace(&mut *waiter.waker.get(), waker);
-                        }
-                    }
-
-                    waiters.push_front(NonNull::from(waiter));
-                    *state = NotifiedState::Waiting;
-
-                    drop(waiters);
-                    drop(old_waker);
-
-                    return Poll::Pending;
-                }
-
-                NotifiedState::Waiting => {
-                    let mut old_waker = None;
-                    let mut waiters = notify.waiters.borrow_mut();
-
-                    if waiter.notification.get().is_some() {
-                        old_waker = unsafe { (*waiter.waker.get()).take() };
-                        waiter.notification.set(None);
-
-                        drop(waiters);
-                        drop(old_waker);
 
                         *state = NotifiedState::Done;
                         return Poll::Ready(());
                     }
+                }
 
-                    let curr = notify.state.get();
-                    if curr.notify_waiters_calls != *notify_waiters_calls {
-                        old_waker = unsafe { (*waiter.waker.get()).take() };
-                        unsafe { waiters.remove(NonNull::from(waiter)) };
-                        *state = NotifiedState::Done;
-                    } else {
-                        unsafe {
-                            let v = &mut *waiter.waker.get();
-                            if let Some(waker) = waker {
-                                let should_update = match v {
-                                    Some(current_waker) => !current_waker.will_wake(waker),
-                                    None => true,
-                                };
-
-                                if should_update {
-                                    old_waker = v.replace(waker.clone());
-                                }
-                            }
-                        }
-
-                        drop(waiters);
-                        drop(old_waker);
-
-                        return Poll::Pending;
+                let mut old_waker = None;
+                if waker.is_some() {
+                    unsafe {
+                        old_waker = mem::replace(&mut *waiter.waker.get(), waker);
                     }
+                }
+
+                waiters.push_front(NonNull::from(waiter));
+                *state = NotifiedState::Waiting;
+
+                drop(waiters);
+                drop(old_waker);
+
+                Poll::Pending
+            }
+
+            NotifiedState::Waiting => {
+                let mut old_waker = None;
+                let mut waiters = notify.waiters.borrow_mut();
+
+                if waiter.notification.get().is_some() {
+                    old_waker = unsafe { (*waiter.waker.get()).take() };
+                    waiter.notification.set(None);
 
                     drop(waiters);
                     drop(old_waker);
-                }
 
-                NotifiedState::Done => {
+                    *state = NotifiedState::Done;
                     return Poll::Ready(());
                 }
+
+                let curr = notify.state.get();
+                if curr.notify_waiters_calls != *notify_waiters_calls {
+                    old_waker = unsafe { (*waiter.waker.get()).take() };
+                    unsafe { waiters.remove(NonNull::from(waiter)) };
+                    *state = NotifiedState::Done;
+
+                    drop(waiters);
+                    drop(old_waker);
+
+                    return Poll::Ready(());
+                }
+
+                unsafe {
+                    let v = &mut *waiter.waker.get();
+                    if let Some(waker) = waker {
+                        let should_update = match v {
+                            Some(current_waker) => !current_waker.will_wake(waker),
+                            None => true,
+                        };
+
+                        if should_update {
+                            old_waker = v.replace(waker.clone());
+                        }
+                    }
+                }
+
+                drop(waiters);
+                drop(old_waker);
+
+                Poll::Pending
             }
+
+            NotifiedState::Done => Poll::Ready(()),
         }
     }
 
