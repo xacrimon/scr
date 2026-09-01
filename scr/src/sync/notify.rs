@@ -1,12 +1,12 @@
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::future::Future;
 use std::marker::PhantomPinned;
+use std::mem;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::task::{Context, LocalWaker, Poll};
-use std::{assert_matches, mem};
 
 use crate::pin;
 use crate::util::WakeList;
@@ -63,6 +63,7 @@ impl<'a> NotifyWaitersList<'a> {
     ) -> NotifyWaitersList<'a> {
         let guard_ptr = NonNull::from(guard.get_ref());
         let list = unguarded_list.into_guarded(guard_ptr);
+
         NotifyWaitersList {
             list,
             is_empty: false,
@@ -75,6 +76,7 @@ impl<'a> NotifyWaitersList<'a> {
         if result.is_none() {
             self.is_empty = true;
         }
+
         result
     }
 }
@@ -186,8 +188,6 @@ impl Notify {
 
         let mut waiters = self.waiters.borrow_mut();
 
-        curr = self.state.get();
-
         if let Some(waker) = notify_locked(&mut waiters, &self.state, curr, strategy) {
             drop(waiters);
             waker.wake();
@@ -209,11 +209,10 @@ impl Notify {
             return;
         }
 
-        let new_state = State {
+        self.state.set(State {
             phase: Phase::Empty,
             notify_waiters_calls: curr.notify_waiters_calls + 1,
-        };
-        self.state.set(new_state);
+        });
 
         let guard = Waiter::new();
         pin!(guard); // TODO: std pin?
@@ -241,20 +240,17 @@ impl Notify {
             }
 
             drop(waiters);
-
             wakers.wake_all();
 
             waiters = self.waiters.borrow_mut();
         }
 
         drop(waiters);
-
         wakers.wake_all();
     }
 
     pub(crate) fn lock_waiter_list(&self) -> NotifyGuard<'_> {
         let guarded_waiters = self.waiters.borrow_mut();
-
         let current_state = self.state.get();
 
         NotifyGuard {
@@ -282,14 +278,14 @@ fn notify_locked(
 ) -> Option<LocalWaker> {
     match curr.phase {
         Phase::Empty | Phase::Notified => {
-            let new_state = State {
+            state.set(State {
                 phase: Phase::Notified,
                 notify_waiters_calls: curr.notify_waiters_calls,
-            };
-            state.set(new_state);
-            // TODO: can anything modify state since curr was read?
+            });
+
             None
         }
+
         Phase::Waiting => {
             let waiter = match strategy {
                 NotifyOneStrategy::Fifo => waiters.pop_back().unwrap(),
@@ -297,16 +293,14 @@ fn notify_locked(
             };
 
             let waiter = unsafe { waiter.as_ref() };
-
             let waker = unsafe { (*waiter.waker.get()).take() };
             waiter.notification.set(Some(Notification::One(strategy)));
 
             if waiters.is_empty() {
-                let new_state = State {
+                state.set(State {
                     phase: Phase::Empty,
                     notify_waiters_calls: curr.notify_waiters_calls,
-                };
-                state.set(new_state);
+                });
             }
 
             waker
@@ -398,20 +392,6 @@ impl Drop for OwnedNotified {
     }
 }
 
-fn cell_cas<T>(cell: &Cell<T>, curr: T, new: T) -> Result<(), T>
-where
-    T: Copy + PartialEq,
-{
-    let v = cell.get();
-
-    if curr != v {
-        return Err(v);
-    }
-
-    cell.set(new);
-    Ok(())
-}
-
 impl NotifiedProject<'_> {
     fn poll_notified(self, waker: Option<&LocalWaker>) -> Poll<()> {
         let NotifiedProject {
@@ -431,77 +411,38 @@ impl NotifiedProject<'_> {
                         continue 'outer_loop;
                     }
 
-                    let cas_curr = State {
-                        phase: Phase::Notified,
-                        notify_waiters_calls: curr.notify_waiters_calls,
-                    };
-                    let cas_new = State {
-                        phase: Phase::Empty,
-                        notify_waiters_calls: curr.notify_waiters_calls,
-                    };
-                    let res = cell_cas(&notify.state, cas_curr, cas_new);
-
-                    if res.is_ok() {
+                    if matches!(curr.phase, Phase::Notified) {
+                        notify.state.set(State {
+                            phase: Phase::Empty,
+                            ..curr
+                        });
                         *state = NotifiedState::Done;
                         continue 'outer_loop;
                     }
 
                     let waker = waker.cloned();
-
+                    let curr = notify.state.get();
                     let mut waiters = notify.waiters.borrow_mut();
-
-                    let mut curr = notify.state.get();
 
                     if curr.notify_waiters_calls != *notify_waiters_calls {
                         *state = NotifiedState::Done;
                         continue 'outer_loop;
                     }
 
-                    loop {
-                        match curr.phase {
-                            Phase::Empty => {
-                                let cas_curr = State {
-                                    phase: Phase::Empty,
-                                    notify_waiters_calls: curr.notify_waiters_calls,
-                                };
-                                let cas_new = State {
-                                    phase: Phase::Waiting,
-                                    notify_waiters_calls: curr.notify_waiters_calls,
-                                };
-                                let res = cell_cas(&notify.state, cas_curr, cas_new);
+                    match curr.phase {
+                        Phase::Waiting => (),
+                        Phase::Empty => notify.state.set(State {
+                            phase: Phase::Waiting,
+                            ..curr
+                        }),
+                        Phase::Notified => {
+                            notify.state.set(State {
+                                phase: Phase::Empty,
+                                ..curr
+                            });
 
-                                if let Err(actual) = res {
-                                    assert_matches!(actual.phase, Phase::Notified);
-                                    curr = actual;
-                                } else {
-                                    break;
-                                }
-                            }
-                            Phase::Waiting => {
-                                break;
-                            }
-                            Phase::Notified => {
-                                let cas_curr = State {
-                                    phase: Phase::Notified,
-                                    notify_waiters_calls: curr.notify_waiters_calls,
-                                };
-                                let cas_new = State {
-                                    phase: Phase::Empty,
-                                    notify_waiters_calls: curr.notify_waiters_calls,
-                                };
-                                let res = cell_cas(&notify.state, cas_curr, cas_new);
-
-                                match res {
-                                    Ok(()) => {
-                                        *state = NotifiedState::Done;
-                                        continue 'outer_loop;
-                                    }
-                                    Err(actual) => {
-                                        assert_matches!(actual.phase, Phase::Empty);
-                                        curr = actual;
-                                    }
-                                }
-                            }
+                            *state = NotifiedState::Done;
+                            continue 'outer_loop;
                         }
                     }
 
@@ -513,7 +454,6 @@ impl NotifiedProject<'_> {
                     }
 
                     waiters.push_front(NonNull::from(waiter));
-
                     *state = NotifiedState::Waiting;
 
                     drop(waiters);
@@ -521,21 +461,13 @@ impl NotifiedProject<'_> {
 
                     return Poll::Pending;
                 }
+
                 NotifiedState::Waiting => {
-                    if waiter.notification.get().is_some() {
-                        drop(unsafe { (*waiter.waker.get()).take() });
-
-                        waiter.notification.set(None);
-                        *state = NotifiedState::Done;
-                        return Poll::Ready(());
-                    }
-
                     let mut old_waker = None;
                     let mut waiters = notify.waiters.borrow_mut();
 
                     if waiter.notification.get().is_some() {
                         old_waker = unsafe { (*waiter.waker.get()).take() };
-
                         waiter.notification.set(None);
 
                         drop(waiters);
@@ -546,21 +478,19 @@ impl NotifiedProject<'_> {
                     }
 
                     let curr = notify.state.get();
-
                     if curr.notify_waiters_calls != *notify_waiters_calls {
                         old_waker = unsafe { (*waiter.waker.get()).take() };
-
                         unsafe { waiters.remove(NonNull::from(waiter)) };
-
                         *state = NotifiedState::Done;
                     } else {
                         unsafe {
                             let v = &mut *waiter.waker.get();
                             if let Some(waker) = waker {
-                                let should_update = match &*v {
+                                let should_update = match v {
                                     Some(current_waker) => !current_waker.will_wake(waker),
                                     None => true,
                                 };
+
                                 if should_update {
                                     old_waker = v.replace(waker.clone());
                                 }
@@ -574,9 +504,9 @@ impl NotifiedProject<'_> {
                     }
 
                     drop(waiters);
-
                     drop(old_waker);
                 }
+
                 NotifiedState::Done => {
                     return Poll::Ready(());
                 }
@@ -595,7 +525,6 @@ impl NotifiedProject<'_> {
         if matches!(*state, NotifiedState::Waiting) {
             let mut waiters = notify.waiters.borrow_mut();
             let mut notify_state = notify.state.get();
-
             let notification = waiter.notification.get();
 
             unsafe { waiters.remove(NonNull::from(waiter)) };
